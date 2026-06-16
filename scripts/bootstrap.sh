@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Clone + pin DuckDB and extension-ci-tools as submodules. Both are pinned
-# to the v1.5.2 release so the build is reproducible. Bump in lockstep.
+# to the v1.5.3 release so the build is reproducible. Bump in lockstep.
 #
 # Safe to re-run; skips already-initialised submodules.
 
 set -euo pipefail
 
-DUCKDB_REF=v1.5.2
-EXT_CI_REF=v1.5.2
+DUCKDB_REF=v1.5.3
+EXT_CI_REF=v1.5.3
 
 cd "$(dirname "$0")/.."
 

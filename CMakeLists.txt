@@ -20,6 +20,12 @@ option(VINDEX_BUILD_UNIT
 option(VINDEX_BUILD_BENCH
        "Build standalone microbenchmarks in test/bench/" OFF)
 
+# The extension uses C++17 patterns (implicit-inline static constexpr, etc.).
+# Set this as a directory-level variable so it applies to all extension
+# targets and subdirectories without affecting DuckDB core's own standard.
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 # -----------------------------------------------------------------------------
 # Sources
 # -----------------------------------------------------------------------------

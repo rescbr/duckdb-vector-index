@@ -1,0 +1,78 @@
+# name: test/sql/aisaq/aisaq_errors.test
+# group: [aisaq]
+#
+# Comprehensive error cases for AiSAQ index creation.
+
+require vindex
+
+statement ok
+CREATE TABLE t(vec FLOAT[8]);
+
+statement ok
+INSERT INTO t SELECT [i, i+1, i+2, i+3, i+4, i+5, i+6, i+7]::FLOAT[8] FROM range(1, 101) t(i);
+
+# FLAT quantizer is rejected.
+statement error
+CREATE INDEX bad_flat ON t USING AISAQ(vec) WITH (quantizer='flat')
+----
+AiSAQ requires a compressing LUT-capable quantizer
+
+# RaBitQ has no LUT distance path.
+statement error
+CREATE INDEX bad_rabitq ON t USING AISAQ(vec) WITH (quantizer='rabitq')
+----
+AiSAQ does not support quantizer='rabitq'
+
+# aisaq_r below minimum (4).
+statement error
+CREATE INDEX bad_r ON t USING AISAQ(vec) WITH (quantizer='pq', m=4, aisaq_r=3)
+----
+aisaq_r
+
+# aisaq_r above maximum (256).
+statement error
+CREATE INDEX bad_r2 ON t USING AISAQ(vec) WITH (quantizer='pq', m=4, aisaq_r=300)
+----
+aisaq_r
+
+# aisaq_alpha below 1.0.
+statement error
+CREATE INDEX bad_alpha ON t USING AISAQ(vec) WITH (quantizer='pq', m=4, aisaq_alpha=0.5)
+----
+aisaq_alpha
+
+# aisaq_alpha above 2.0.
+statement error
+CREATE INDEX bad_alpha2 ON t USING AISAQ(vec) WITH (quantizer='pq', m=4, aisaq_alpha=3.0)
+----
+aisaq_alpha
+
+# aisaq_entry_points = 0.
+statement error
+CREATE INDEX bad_ep ON t USING AISAQ(vec) WITH (quantizer='pq', m=4, aisaq_entry_points=0)
+----
+aisaq_entry_points
+
+# aisaq_entry_points above 64.
+statement error
+CREATE INDEX bad_ep2 ON t USING AISAQ(vec) WITH (quantizer='pq', m=4, aisaq_entry_points=100)
+----
+aisaq_entry_points
+
+# Unknown option.
+statement error
+CREATE INDEX bad_opt ON t USING AISAQ(vec) WITH (quantizer='pq', m=4, notreal=1)
+----
+Unknown option for AiSAQ index
+
+# label_column must be BIGINT.
+statement error
+CREATE INDEX bad_label ON t USING AISAQ(vec) WITH (quantizer='pq', m=4, label_column='vec')
+----
+must be BIGINT
+
+# label_column not found in table.
+statement error
+CREATE INDEX bad_label2 ON t USING AISAQ(vec) WITH (quantizer='pq', m=4, label_column='nonexistent')
+----
+not found in table

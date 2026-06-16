@@ -1,0 +1,58 @@
+# name: test/sql/aisaq/aisaq_scann.test
+# group: [aisaq]
+#
+# ScaNN quantizer specific paths: various m/eta values, EXPLAIN, pragma.
+
+require vindex
+
+statement ok
+CREATE TABLE t(id INTEGER, vec FLOAT[8]);
+
+statement ok
+INSERT INTO t SELECT i::INTEGER, [i, i+1, i+2, i+3, i+4, i+5, i+6, i+7]::FLOAT[8] FROM range(1, 501) t(i);
+
+# ScaNN with m=4, eta=2.0
+statement ok
+CREATE INDEX scann_m4 ON t USING AISAQ(vec) WITH (quantizer='scann', m=4, bits=8, eta=2.0, aisaq_r=16, aisaq_l=64);
+
+query II
+EXPLAIN SELECT id FROM t ORDER BY array_distance(vec, [10,11,12,13,14,15,16,17]::FLOAT[8]) LIMIT 5
+----
+physical_plan	<REGEX>:(?s).*TOP_N.*VINDEX_INDEX_SCAN.*
+
+query I
+SELECT count(*) FROM (SELECT id FROM t ORDER BY array_distance(vec, [10,11,12,13,14,15,16,17]::FLOAT[8]) LIMIT 5)
+----
+5
+
+statement ok
+DROP INDEX scann_m4;
+
+# ScaNN with m=8, eta=4.0
+statement ok
+CREATE INDEX scann_m8 ON t USING AISAQ(vec) WITH (quantizer='scann', m=8, bits=8, eta=4.0, aisaq_r=16, aisaq_l=64);
+
+query I
+SELECT count(*) FROM (SELECT id FROM t ORDER BY array_distance(vec, [10,11,12,13,14,15,16,17]::FLOAT[8]) LIMIT 3)
+----
+3
+
+statement ok
+DROP INDEX scann_m8;
+
+# Pragma reports scann.
+statement ok
+CREATE INDEX scann_pragma ON t USING AISAQ(vec) WITH (quantizer='scann', m=4, bits=8, eta=4.0, aisaq_r=32, aisaq_l=100);
+
+query T
+SELECT quantizer FROM pragma_vindex_aisaq_index_info() WHERE index_name = 'scann_pragma'
+----
+scann
+
+query II
+SELECT graph_degree, beam_width FROM pragma_vindex_aisaq_index_info() WHERE index_name = 'scann_pragma'
+----
+32	100
+
+statement ok
+DROP INDEX scann_pragma;

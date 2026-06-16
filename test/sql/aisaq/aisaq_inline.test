@@ -1,0 +1,64 @@
+# name: test/sql/aisaq/aisaq_inline.test
+# group: [aisaq]
+#
+# aisaq_inline_pq knob: 0 (default), small, max (= aisaq_r), and overflow.
+
+require vindex
+
+statement ok
+CREATE TABLE t(id INTEGER, vec FLOAT[8]);
+
+statement ok
+INSERT INTO t SELECT i::INTEGER, [i, i+1, i+2, i+3, i+4, i+5, i+6, i+7]::FLOAT[8] FROM range(1, 501) t(i);
+
+# Default: aisaq_inline_pq=0.
+statement ok
+CREATE INDEX inl0 ON t USING AISAQ(vec) WITH (quantizer='pq', m=4, bits=8, aisaq_r=16, aisaq_l=64, aisaq_inline_pq=0);
+
+query II
+EXPLAIN SELECT id FROM t ORDER BY array_distance(vec, [10,11,12,13,14,15,16,17]::FLOAT[8]) LIMIT 5
+----
+physical_plan	<REGEX>:(?s).*TOP_N.*VINDEX_INDEX_SCAN.*
+
+query I
+SELECT count(*) FROM (SELECT id FROM t ORDER BY array_distance(vec, [10,11,12,13,14,15,16,17]::FLOAT[8]) LIMIT 5)
+----
+5
+
+statement ok
+DROP INDEX inl0;
+
+# Small inline: aisaq_inline_pq=8.
+statement ok
+CREATE INDEX inl8 ON t USING AISAQ(vec) WITH (quantizer='pq', m=4, bits=8, aisaq_r=16, aisaq_l=64, aisaq_inline_pq=8);
+
+query I
+SELECT count(*) FROM (SELECT id FROM t ORDER BY array_distance(vec, [10,11,12,13,14,15,16,17]::FLOAT[8]) LIMIT 5)
+----
+5
+
+query I
+SELECT inline_pq FROM pragma_vindex_aisaq_index_info() WHERE index_name = 'inl8'
+----
+8
+
+statement ok
+DROP INDEX inl8;
+
+# Max inline: aisaq_inline_pq = aisaq_r = 16.
+statement ok
+CREATE INDEX inl16 ON t USING AISAQ(vec) WITH (quantizer='pq', m=4, bits=8, aisaq_r=16, aisaq_l=64, aisaq_inline_pq=16);
+
+query I
+SELECT count(*) FROM (SELECT id FROM t ORDER BY array_distance(vec, [10,11,12,13,14,15,16,17]::FLOAT[8]) LIMIT 5)
+----
+5
+
+statement ok
+DROP INDEX inl16;
+
+# Overflow: aisaq_inline_pq > aisaq_r → error.
+statement error
+CREATE INDEX inl_bad ON t USING AISAQ(vec) WITH (quantizer='pq', m=4, bits=8, aisaq_r=16, aisaq_l=64, aisaq_inline_pq=32)
+----
+aisaq_inline_pq

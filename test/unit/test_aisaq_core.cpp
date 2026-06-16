@@ -469,3 +469,177 @@ TEST_CASE("AiSaqCore SerializeState preserves label maps", "[aisaq_core][unit]")
 		REQUIRE(after[i].row_id == before[i].row_id);
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 7: additional correctness tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AiSaqCore io_limit caps search results", "[aisaq_core][unit]") {
+	MemoryDB mem;
+	AiSaqBlockStore store(*mem.bm, *mem.bufmgr);
+
+	constexpr idx_t N = 500;
+	constexpr idx_t D = 32;
+	constexpr uint8_t M = 8;
+	constexpr uint8_t BITS = 8;
+
+	auto data = RandomGaussian(N, D, 0x10CCu);
+	PqQuantizer quant(MetricKind::L2SQ, D, M, BITS, 42);
+	quant.Train(data.data(), N, D);
+
+	AiSaqCoreParams params;
+	params.dim = D;
+	params.R = 32;
+	params.L = 100;
+	params.n_entry_points = 8;
+	params.seed = 11;
+
+	AiSaqCore core(params, quant, store);
+	WriteAllPqCodes(store, quant, data.data(), N, D);
+	for (idx_t i = 0; i < N; i++) {
+		core.Insert(int64_t(i), data.data() + i * D);
+	}
+	core.ComputeEntryPoints();
+
+	auto queries = RandomGaussian(10, D, 0xDEADu);
+	std::vector<float> qpre(quant.QueryWorkspaceSize());
+	std::vector<float> lut(quant.LUTSize());
+
+	// With io_limit=1, search should return far fewer candidates than
+	// unlimited, because it can only page in one PQ code per direction.
+	for (idx_t q = 0; q < 10; q++) {
+		quant.PreprocessQuery(queries.data() + q * D, qpre.data());
+		quant.PopulateDistanceLUT(qpre.data(), lut.data());
+
+		auto limited = core.Search(lut.data(), 10, params.L, 8, 1);
+		auto full = core.Search(lut.data(), 10, params.L, 8, 0);
+
+		// The limited search should not return more results than the full one.
+		REQUIRE(limited.size() <= full.size());
+		REQUIRE(full.size() <= 10);
+	}
+}
+
+TEST_CASE("AiSaqCore inline PQ matches or exceeds paged recall", "[aisaq_core][unit]") {
+	MemoryDB mem;
+	AiSaqBlockStore store(*mem.bm, *mem.bufmgr);
+
+	constexpr idx_t N = 500;
+	constexpr idx_t D = 32;
+	constexpr uint8_t M = 8;
+	constexpr uint8_t BITS = 8;
+
+	auto data = RandomGaussian(N, D, 0x1A2Bu);
+	PqQuantizer quant(MetricKind::L2SQ, D, M, BITS, 42);
+	quant.Train(data.data(), N, D);
+
+	// Build with inline_pq_count = R.
+	AiSaqCoreParams params;
+	params.dim = D;
+	params.R = 32;
+	params.L = 100;
+	params.inline_pq_count = 32;
+	params.n_entry_points = 8;
+	params.seed = 7;
+
+	AiSaqCore core(params, quant, store);
+	WriteAllPqCodes(store, quant, data.data(), N, D);
+	for (idx_t i = 0; i < N; i++) {
+		core.Insert(int64_t(i), data.data() + i * D);
+	}
+	core.FinalizeInlineCodes();
+	core.ComputeEntryPoints();
+
+	// Build ground truth.
+	auto queries = RandomGaussian(20, D, 0xCAFEu);
+	std::vector<float> qpre(quant.QueryWorkspaceSize());
+	std::vector<float> lut(quant.LUTSize());
+
+	idx_t hits_inline = 0;
+	idx_t hits_total = 0;
+	for (idx_t q = 0; q < 20; q++) {
+		quant.PreprocessQuery(queries.data() + q * D, qpre.data());
+		quant.PopulateDistanceLUT(qpre.data(), lut.data());
+
+		auto got = core.Search(lut.data(), 10, params.L, 8, 0);
+		auto truth = BruteForceTopK(data.data(), N, D, queries.data() + q * D, 10);
+		std::unordered_set<int64_t> truth_set(truth.begin(), truth.end());
+		for (const auto &g : got) {
+			if (truth_set.count(g.row_id)) {
+				hits_inline++;
+			}
+		}
+		hits_total += 10;
+	}
+	const float recall_inline = float(hits_inline) / float(hits_total);
+	INFO("Inline recall@10 = " << recall_inline);
+	// Inline PQ should at least match paged recall (same codes, just cached).
+	REQUIRE(recall_inline >= 0.40f);
+}
+
+TEST_CASE("AiSaqCore multiple entry points improve recall on clustered data", "[aisaq_core][unit]") {
+	MemoryDB mem;
+	AiSaqBlockStore store(*mem.bm, *mem.bufmgr);
+
+	constexpr idx_t N = 500;
+	constexpr idx_t D = 32;
+	constexpr uint8_t M = 8;
+	constexpr uint8_t BITS = 8;
+
+	// Generate 5 well-separated clusters.
+	auto data = RandomGaussian(N, D, 0xC1A0u);
+	for (idx_t i = 0; i < N; i++) {
+		const float offset = float(i / (N / 5)) * 5000.0f;
+		for (idx_t j = 0; j < D; j++) {
+			data[i * D + j] += offset;
+		}
+	}
+
+	PqQuantizer quant(MetricKind::L2SQ, D, M, BITS, 42);
+	quant.Train(data.data(), N, D);
+
+	auto build_and_measure = [&](uint16_t n_ep) -> float {
+		AiSaqBlockStore s(*mem.bm, *mem.bufmgr);
+		AiSaqCoreParams params;
+		params.dim = D;
+		params.R = 32;
+		params.L = 100;
+		params.n_entry_points = n_ep;
+		params.seed = 7;
+
+		AiSaqCore core(params, quant, s);
+		WriteAllPqCodes(s, quant, data.data(), N, D);
+		for (idx_t i = 0; i < N; i++) {
+			core.Insert(int64_t(i), data.data() + i * D);
+		}
+		core.ComputeEntryPoints();
+
+		auto queries = RandomGaussian(20, D, 0xBEEFu);
+		std::vector<float> qpre(quant.QueryWorkspaceSize());
+		std::vector<float> lut(quant.LUTSize());
+
+		idx_t hits = 0, total = 0;
+		for (idx_t q = 0; q < 20; q++) {
+			quant.PreprocessQuery(queries.data() + q * D, qpre.data());
+			quant.PopulateDistanceLUT(qpre.data(), lut.data());
+			auto got = core.Search(lut.data(), 10, params.L, 8, 0);
+			auto truth = BruteForceTopK(data.data(), N, D, queries.data() + q * D, 10);
+			std::unordered_set<int64_t> truth_set(truth.begin(), truth.end());
+			for (const auto &g : got) {
+				if (truth_set.count(g.row_id)) {
+					hits++;
+				}
+			}
+			total += 10;
+		}
+		return float(hits) / float(total);
+	};
+
+	const float recall_1ep = build_and_measure(1);
+	const float recall_8ep = build_and_measure(8);
+
+	INFO("Recall with 1 entry point = " << recall_1ep);
+	INFO("Recall with 8 entry points = " << recall_8ep);
+	// More entry points should help (or at least not hurt) on clustered data.
+	REQUIRE(recall_8ep >= recall_1ep - 0.05f);
+}

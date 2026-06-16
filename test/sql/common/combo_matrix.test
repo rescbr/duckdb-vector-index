@@ -13,11 +13,11 @@
 # `make matrix` or `VINDEX_RUN_MATRIX=1 make test`.
 #
 # Dimensions:
-#   algorithm ∈ { hnsw, ivf, diskann, spann }
+#   algorithm ∈ { hnsw, ivf, diskann, spann, aisaq }
 #   quantizer ∈ { flat, rabitq, pq, scann }
 #   metric    ∈ { l2sq, cosine, ip }
 #
-# = 48 cells. Backend-known unsupported cells (documented in README /
+# = 60 cells. Backend-known unsupported cells (documented in README /
 # doc/plan.md) use `statement error` with the exact thrown substring.
 
 require vindex
@@ -364,3 +364,79 @@ CREATE INDEX spann_scann_ip ON t USING SPANN (vec) WITH (metric='ip', quantizer=
 
 statement ok
 DROP INDEX spann_scann_ip;
+
+# ============================================================================
+# AiSAQ — rejects flat (needs compressing LUT quantizer) and rabitq (no LUT).
+# ============================================================================
+
+# -- aisaq × flat (all rejected) ----------------------------------------------
+
+statement error
+CREATE INDEX aisaq_flat_l2sq ON t USING AISAQ (vec) WITH (metric='l2sq', quantizer='flat');
+----
+AiSAQ requires a compressing LUT-capable quantizer
+
+statement error
+CREATE INDEX aisaq_flat_cosine ON t USING AISAQ (vec) WITH (metric='cosine', quantizer='flat');
+----
+AiSAQ requires a compressing LUT-capable quantizer
+
+statement error
+CREATE INDEX aisaq_flat_ip ON t USING AISAQ (vec) WITH (metric='ip', quantizer='flat');
+----
+AiSAQ requires a compressing LUT-capable quantizer
+
+# -- aisaq × rabitq (all rejected) --------------------------------------------
+
+statement error
+CREATE INDEX aisaq_rabitq_l2sq ON t USING AISAQ (vec) WITH (metric='l2sq', quantizer='rabitq', bits=3);
+----
+AiSAQ does not support quantizer='rabitq'
+
+statement error
+CREATE INDEX aisaq_rabitq_cosine ON t USING AISAQ (vec) WITH (metric='cosine', quantizer='rabitq', bits=3);
+----
+AiSAQ does not support quantizer='rabitq'
+
+statement error
+CREATE INDEX aisaq_rabitq_ip ON t USING AISAQ (vec) WITH (metric='ip', quantizer='rabitq', bits=3);
+----
+AiSAQ does not support quantizer='rabitq'
+
+# -- aisaq × pq ---------------------------------------------------------------
+
+statement ok
+CREATE INDEX aisaq_pq_l2sq ON t USING AISAQ (vec) WITH (metric='l2sq', quantizer='pq', m=8, bits=4);
+
+statement ok
+DROP INDEX aisaq_pq_l2sq;
+
+statement error
+CREATE INDEX aisaq_pq_cosine ON t USING AISAQ (vec) WITH (metric='cosine', quantizer='pq', m=8, bits=4);
+----
+PQ quantizer does not support cosine
+
+statement ok
+CREATE INDEX aisaq_pq_ip ON t USING AISAQ (vec) WITH (metric='ip', quantizer='pq', m=8, bits=4);
+
+statement ok
+DROP INDEX aisaq_pq_ip;
+
+# -- aisaq × scann ------------------------------------------------------------
+
+statement ok
+CREATE INDEX aisaq_scann_l2sq ON t USING AISAQ (vec) WITH (metric='l2sq', quantizer='scann', m=8, bits=4);
+
+statement ok
+DROP INDEX aisaq_scann_l2sq;
+
+statement error
+CREATE INDEX aisaq_scann_cosine ON t USING AISAQ (vec) WITH (metric='cosine', quantizer='scann', m=8, bits=4);
+----
+scann quantizer does not support cosine
+
+statement ok
+CREATE INDEX aisaq_scann_ip ON t USING AISAQ (vec) WITH (metric='ip', quantizer='scann', m=8, bits=4);
+
+statement ok
+DROP INDEX aisaq_scann_ip;

@@ -55,6 +55,9 @@ CONFIGS = {
     "spann-rabitq3":       ("SPANN", "WITH (quantizer='rabitq', bits=3, rerank=10, nlist=128, nprobe=16, replica_count=8, closure_factor=1.1)"),
     "spann-pq":            ("SPANN", "WITH (quantizer='pq', m=16, bits=8, rerank=10, nlist=128, nprobe=16, replica_count=8, closure_factor=1.1)"),
     "spann-scann":         ("SPANN", "WITH (quantizer='scann', m=16, bits=8, eta=4.0, rerank=10, nlist=128, nprobe=16, replica_count=8, closure_factor=1.1)"),
+    "aisaq-pq":            ("AISAQ", "WITH (quantizer='pq', m=16, bits=8, rerank=10, aisaq_r=64, aisaq_l=100)"),
+    "aisaq-scann":         ("AISAQ", "WITH (quantizer='scann', m=16, bits=8, eta=4.0, rerank=10, aisaq_r=64, aisaq_l=100)"),
+    "aisaq-pq-inline64":   ("AISAQ", "WITH (quantizer='pq', m=16, bits=8, rerank=10, aisaq_r=64, aisaq_l=100, aisaq_inline_pq=64)"),
 }
 
 # Recall@10 thresholds per (algo, dataset). Anything below → non-zero exit.
@@ -79,6 +82,9 @@ THRESHOLDS = {
     ("spann-rabitq3",       "siftsmall"): 0.90,
     ("spann-pq",            "siftsmall"): 0.90,
     ("spann-scann",         "siftsmall"): 0.90,
+    ("aisaq-pq",            "siftsmall"): 0.90,
+    ("aisaq-scann",         "siftsmall"): 0.90,
+    ("aisaq-pq-inline64",   "siftsmall"): 0.90,
     ("hnsw-flat",           "sift1m"):    0.98,
     ("hnsw-rabitq3",        "sift1m"):    0.99,
     ("hnsw-rabitq1-rerank", "sift1m"):    0.90,
@@ -95,6 +101,9 @@ THRESHOLDS = {
     ("spann-rabitq3",       "sift1m"):    0.95,
     ("spann-pq",            "sift1m"):    0.95,
     ("spann-scann",         "sift1m"):    0.95,
+    ("aisaq-pq",            "sift1m"):    0.95,
+    ("aisaq-scann",         "sift1m"):    0.95,
+    ("aisaq-pq-inline64",   "sift1m"):    0.95,
 }
 
 

@@ -1,5 +1,8 @@
 #include "vindex/vector_index_registry.hpp"
 
+#include "duckdb/common/types.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/storage/index.hpp"
@@ -56,6 +59,12 @@ void RegisterBuiltInAlgorithms(ExtensionLoader &loader) {
 
 	// 2) Shared optimizers — registered once, dispatch via VectorIndexRegistry.
 	auto &db = loader.GetDatabaseInstance();
+
+	if (!db.config.GetOptionByName("vindex_gpu_backend")) {
+		db.config.AddExtensionOption("vindex_gpu_backend", "GPU backend for vector index operations (cpu, vulkan)",
+		                             LogicalType::VARCHAR, Value("cpu"));
+	}
+
 	RegisterExprOptimizer(db);
 	RegisterScanOptimizer(db);
 	RegisterTopKOptimizer(db);

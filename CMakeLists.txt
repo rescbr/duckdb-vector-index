@@ -39,6 +39,7 @@ set(EXTENSION_SOURCES src/vindex_extension.cpp)
 add_subdirectory(src/common)
 add_subdirectory(src/algo)
 add_subdirectory(src/quant)
+add_subdirectory(src/backend)
 
 # -----------------------------------------------------------------------------
 # Build the static + loadable extension (DuckDB build macros)

@@ -66,6 +66,12 @@ void RegisterBuiltInAlgorithms(ExtensionLoader &loader) {
 		db.config.AddExtensionOption("vindex_gpu_backend", "GPU backend for vector index operations (cpu, vulkan)",
 		                             LogicalType::VARCHAR, Value("cpu"));
 	}
+	if (!db.config.GetOptionByName("vindex_log_level")) {
+		db.config.AddExtensionOption("vindex_log_level",
+		                             "vindex logging verbosity: 'off' (default), 'info', 'debug', 'profile'. "
+		                             "Overridden by VINDEX_LOG_LEVEL environment variable.",
+		                             LogicalType::VARCHAR, Value("off"));
+	}
 
 	RegisterExprOptimizer(db);
 	RegisterScanOptimizer(db);

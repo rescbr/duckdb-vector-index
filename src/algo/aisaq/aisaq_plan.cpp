@@ -80,6 +80,10 @@ PhysicalOperator &AiSaqIndex::CreatePlan(PlanIndexInput &input) {
 			if (v.type() != LogicalType::INTEGER && v.type() != LogicalType::BIGINT) {
 				throw BinderException("AiSAQ index 'aisaq_l' must be an integer");
 			}
+		} else if (StringUtil::CIEquals(k, "aisaq_l_build")) {
+			if (v.type() != LogicalType::INTEGER && v.type() != LogicalType::BIGINT) {
+				throw BinderException("AiSAQ index 'aisaq_l_build' must be an integer");
+			}
 		} else if (StringUtil::CIEquals(k, "aisaq_alpha")) {
 			if (v.type() != LogicalType::FLOAT && v.type() != LogicalType::DOUBLE) {
 				// Allow numeric literals; the index constructor range-checks.
@@ -99,6 +103,19 @@ PhysicalOperator &AiSaqIndex::CreatePlan(PlanIndexInput &input) {
 		} else if (StringUtil::CIEquals(k, "aisaq_entry_points")) {
 			if (v.type() != LogicalType::INTEGER && v.type() != LogicalType::BIGINT) {
 				throw BinderException("AiSAQ index 'aisaq_entry_points' must be an integer");
+			}
+		} else if (StringUtil::CIEquals(k, "build_strategy")) {
+			if (v.type() != LogicalType::VARCHAR) {
+				throw BinderException("AiSAQ index 'build_strategy' must be a string");
+			}
+			const auto s = StringUtil::Lower(v.GetValue<string>());
+			if (s != "auto" && s != "paged" && s != "pq_buffer" && s != "exact_prune") {
+				throw BinderException("AiSAQ index 'build_strategy' must be one of: 'auto', 'paged', 'pq_buffer', "
+				                      "'exact_prune' (slow, best quality)");
+			}
+		} else if (StringUtil::CIEquals(k, "ram_budget_mb")) {
+			if (v.type() != LogicalType::INTEGER && v.type() != LogicalType::BIGINT) {
+				throw BinderException("AiSAQ index 'ram_budget_mb' must be an integer");
 			}
 		} else {
 			throw BinderException("Unknown option for AiSAQ index: '%s'", k);

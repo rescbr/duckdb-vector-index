@@ -15,6 +15,9 @@
 #include "duckdb/storage/table_io_manager.hpp"
 
 #include "algo/aisaq/aisaq_index.hpp"
+#include "vindex/logging.hpp"
+
+#include <chrono>
 
 namespace duckdb {
 namespace vindex {
@@ -53,6 +56,7 @@ class CreateAiSaqIndexGlobalState final : public GlobalSinkState {
 
 	atomic<bool> is_building{false};
 	atomic<idx_t> loaded_count{0};
+	atomic<idx_t> pq_encoded_count{0};
 	atomic<idx_t> built_count{0};
 };
 
@@ -151,6 +155,9 @@ class AiSaqIndexConstructTask final : public ExecutorTask {
 
 		const bool has_labels = gstate.has_labels;
 		const idx_t row_id_col = has_labels ? 2 : 1;
+		const LogLevel log_level = gstate.global_index->GetBuildLogLevel();
+		const idx_t total_n = collection->Count();
+		auto last_log = std::chrono::steady_clock::now();
 
 		while (collection->Scan(scan_state, local_scan_state, scan_chunk)) {
 			const auto count = scan_chunk.size();
@@ -163,11 +170,26 @@ class AiSaqIndexConstructTask final : public ExecutorTask {
 			gstate.global_index->Construct(build_chunk, row_ids, thread_id, labels);
 			gstate.built_count += count;
 
+			if (LogInfo(log_level)) {
+				auto now = std::chrono::steady_clock::now();
+				if (now - last_log > std::chrono::seconds(2)) {
+					const auto built = gstate.built_count.load();
+					fprintf(stderr, "[vindex] graph construction: %llu/%llu (%.0f%%)\n",
+					        (unsigned long long)built, (unsigned long long)total_n,
+					        100.0 * double(built) / double(total_n));
+					last_log = now;
+				}
+			}
+
 			if (mode == TaskExecutionMode::PROCESS_PARTIAL) {
 				return TaskExecutionResult::TASK_NOT_FINISHED;
 			}
 		}
 
+		if (LogInfo(log_level)) {
+			fprintf(stderr, "[vindex] graph construction: %llu/%llu (100%%)\n",
+			        (unsigned long long)gstate.built_count.load(), (unsigned long long)total_n);
+		}
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
 	}
@@ -210,9 +232,24 @@ class AiSaqIndexConstructionEvent final : public BasePipelineEvent {
 	}
 
 	void FinishEvent() override {
+		const LogLevel ll = gstate.global_index->GetBuildLogLevel();
+		if (LogInfo(ll)) {
+			fprintf(stderr, "[vindex] finalizing inline codes...\n");
+		}
 		gstate.global_index->FinalizeInlineCodes();
+		if (LogInfo(ll)) {
+			fprintf(stderr, "[vindex] computing entry points...\n");
+		}
 		gstate.global_index->ComputeEntryPoints();
+		if (LogInfo(ll)) {
+			fprintf(stderr, "[vindex] computing label medoids...\n");
+		}
 		gstate.global_index->ComputeLabelMedoids();
+		if (LogInfo(ll)) {
+			fprintf(stderr, "[vindex] flushing graph nodes to block store...\n");
+		}
+		gstate.global_index->FlushBuildNodes();
+		gstate.global_index->ClearBuildBuffers();
 		gstate.global_index->SetDirty();
 		gstate.global_index->SyncSize();
 
@@ -251,11 +288,32 @@ SinkFinalizeType PhysicalCreateAiSaqIndex::Finalize(Pipeline &pipeline, Event &e
 
 	gstate.is_building = true;
 
+	// Resolve log level (env var overrides session option).
+	auto log_level = GetLogLevel(context);
+	gstate.global_index->SetBuildLogLevel(log_level);
+
+	// Resolve build strategy (Tier 1/2/3) before encoding.
+	gstate.global_index->ResolveBuildStrategy(context, collection->Count());
+
 	// Pass 1 prerequisite: train the quantizer before encoding any codes.
+	if (LogInfo(log_level)) {
+		fprintf(stderr, "[vindex] training quantizer on %llu vectors...\n",
+		        (unsigned long long)collection->Count());
+	}
 	gstate.global_index->TrainQuantizer(*collection);
 
-	// Pass 1: PQ encoding — write all codes to block-store pages.
+	// Pass 1: PQ encoding — write all codes to block-store pages. Also
+	// populates flat build buffers if Tier 2/3 is active.
+	gstate.global_index->SetPqEncodeProgress(&gstate.pq_encoded_count);
 	gstate.global_index->EncodePqCodes(*collection);
+	gstate.global_index->SetPqEncodeProgress(nullptr);
+	if (LogInfo(log_level)) {
+		fprintf(stderr, "[vindex] PQ encoding complete: %llu vectors\n",
+		        (unsigned long long)gstate.pq_encoded_count.load());
+	}
+
+	// Activate flat buffers on the core (zero-op for Tier 1).
+	gstate.global_index->ActivateBuildBuffers();
 
 	// Pass 2: graph construction — Vamana online inserts. Re-scan the same
 	// collection in the same order so internal_ids match the PQ code layout.
@@ -270,12 +328,16 @@ ProgressData PhysicalCreateAiSaqIndex::GetSinkProgress(ClientContext &context, G
                                                        ProgressData source_progress) const {
 	ProgressData res;
 	const auto &state = gstate.Cast<CreateAiSaqIndexGlobalState>();
+	// 3-phase tracking: load + PQ encode + graph construction.
+	const idx_t total = state.loaded_count.load() + state.loaded_count.load() + state.loaded_count.load();
 	if (!state.is_building) {
-		res.done = state.loaded_count + 0.0;
-		res.total = estimated_cardinality + estimated_cardinality;
+		// Phase 1: loading vectors into the collection.
+		res.done = state.loaded_count.load() + 0.0;
+		res.total = double(total);
 	} else {
-		res.done = state.loaded_count + state.built_count;
-		res.total = state.loaded_count + state.loaded_count;
+		// Phase 2+3: PQ encode + construction (both contribute to the back 2/3).
+		res.done = double(state.loaded_count.load() + state.pq_encoded_count.load() + state.built_count.load());
+		res.total = double(total);
 	}
 	return res;
 }

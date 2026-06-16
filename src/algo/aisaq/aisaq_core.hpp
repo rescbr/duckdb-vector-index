@@ -7,10 +7,12 @@
 
 #include "algo/aisaq/aisaq_block_store.hpp"
 #include "vindex/label_filter.hpp"
+#include "vindex/metric.hpp"
 #include "vindex/quantizer.hpp"
 #include "vindex/unaligned.hpp"
 
 #include <cstdint>
+#include <cstring>
 #include <random>
 
 namespace duckdb {
@@ -42,6 +44,7 @@ struct AiSaqCoreParams {
 	uint16_t inline_pq_count = 0; // codes inlined into the node for the first N neighbors
 	uint16_t beam_width = 8;      // search beam width (I/O batching hint)
 	uint16_t n_entry_points = 16;
+	uint16_t L_build = 0; // 0 = use R (Vamana paper recommendation)
 	uint64_t seed = 0xA15A6ULL;
 };
 
@@ -105,6 +108,41 @@ class AiSaqCore {
 	// Whether any labels have been registered.
 	bool HasLabels() const {
 		return !label_to_internal_ids_.empty();
+	}
+
+	// --- build-time acceleration buffers -------------------------------
+	// Tier 2: flat PQ code buffer. When active, CodeDistance and
+	// DistanceToCode index directly into this buffer instead of paging
+	// through BufferManager.
+	void SetBuildCodes(const uint8_t *codes, idx_t count) {
+		build_codes_ = codes;
+		build_codes_count_ = count;
+	}
+	// Tier 3: flat full-precision vectors. When active, RobustPrune uses
+	// exact distances for topology decisions (mirrors ref/aisaq-diskann).
+	void SetBuildVectors(const float *vecs, idx_t dim, MetricKind metric) {
+		build_vectors_ = vecs;
+		build_metric_ = metric;
+	}
+	// Tier 2: flat graph node buffer. When active, PinNode returns a pointer
+	// into this buffer instead of going through BufferManager. The buffer is
+	// flushed to AiSaqBlockStore after construction completes.
+	void SetBuildNodes(data_ptr_t nodes) {
+		build_nodes_ = nodes;
+	}
+	void ClearBuildBuffers() {
+		build_codes_ = nullptr;
+		build_codes_count_ = 0;
+		build_vectors_ = nullptr;
+		build_nodes_ = nullptr;
+	}
+	bool HasBuildCodes() const {
+		return build_codes_ != nullptr;
+	}
+	// Pre-size internal buffers for construction (avoids repeated realloc).
+	void PrepareForBuild(idx_t estimated_count) {
+		visit_marks_.assign(estimated_count, 0);
+		visit_counter_ = 0;
 	}
 
 	idx_t Size() const {
@@ -174,6 +212,9 @@ class AiSaqCore {
 		data_ptr_t ptr;
 	};
 	NodeRef PinNode(uint32_t internal_id) const {
+		if (build_nodes_) {
+			return {BufferHandle(), build_nodes_ + idx_t(internal_id) * store_.NodeSize()};
+		}
 		auto handle = store_.PinGraphNode(internal_id);
 		const idx_t off = (idx_t(internal_id) % store_.NodesPerBlock()) * store_.NodeSize();
 		// Capture the pointer BEFORE moving the handle out — Ptr() on a
@@ -185,18 +226,46 @@ class AiSaqCore {
 	// Pick the best entry point for a query LUT.
 	uint32_t PickEntryPoint(const float *query_lut) const;
 
-	// Estimate distance from the query LUT to a node's code (pages in the code).
+	// Estimate distance from the query LUT to a node's code. Uses flat
+	// build buffer (Tier 2) when available, else pages via BufferManager.
 	float DistanceToCode(const float *query_lut, uint32_t internal_id) const {
+		if (build_codes_) {
+			return quantizer_.LUTDistance(build_codes_ + idx_t(internal_id) * code_size_, query_lut);
+		}
 		auto ref = ReadPqCode(internal_id);
 		return quantizer_.LUTDistance(ref.ptr, query_lut);
 	}
 
-	// Code-to-code distance (pags both codes in).
+	// Code-to-code distance. Tier 3 uses full-precision vectors; Tier 2
+	// uses flat PQ buffer; Tier 1 pages via BufferManager (callers should
+	// use per-prune gather pattern via CopyBuildCode).
 	float CodeDistance(uint32_t a, uint32_t b) const {
+		if (build_vectors_) {
+			return RawDistance(build_vectors_ + idx_t(a) * params_.dim, build_vectors_ + idx_t(b) * params_.dim);
+		}
+		if (build_codes_) {
+			return quantizer_.CodeDistance(build_codes_ + idx_t(a) * code_size_,
+			                                build_codes_ + idx_t(b) * code_size_);
+		}
 		auto ra = ReadPqCode(a);
 		auto rb = ReadPqCode(b);
 		return quantizer_.CodeDistance(ra.ptr, rb.ptr);
 	}
+
+	// Copy the PQ code for internal_id into dst. Uses flat buffer when
+	// available (Tier 2), else reads from block store (1 BufferManager Pin).
+	// Used by the per-prune gather pattern (Tier 1).
+	void CopyBuildCode(uint32_t internal_id, uint8_t *dst) const {
+		if (build_codes_) {
+			std::memcpy(dst, build_codes_ + idx_t(internal_id) * code_size_, code_size_);
+		} else {
+			auto ref = ReadPqCode(internal_id);
+			std::memcpy(dst, ref.ptr, code_size_);
+		}
+	}
+
+	// Full-precision distance for Tier 3 prune.
+	float RawDistance(const float *a, const float *b) const;
 
 	// Vamana greedy beam search. Returns up to `L` nearest candidates
 	// (ascending distance). Candidates carry internal_id in the row_id field;
@@ -228,6 +297,14 @@ class AiSaqCore {
 
 	uint32_t size_ = 0;
 
+	// Build-time acceleration buffers (non-owning; owned by AiSaqIndex).
+	// When non-null, code access skips BufferManager entirely.
+	const uint8_t *build_codes_ = nullptr;
+	idx_t build_codes_count_ = 0;
+	const float *build_vectors_ = nullptr;
+	MetricKind build_metric_ = MetricKind::L2SQ;
+	data_ptr_t build_nodes_ = nullptr;
+
 	// Label bookkeeping (populated when labels are provided at insert time).
 	// internal_id → label (for candidate filtering during search).
 	unordered_map<uint32_t, int64_t> internal_id_to_label_;
@@ -241,6 +318,7 @@ class AiSaqCore {
 	mutable vector<uint32_t> visit_marks_;
 	mutable uint32_t visit_counter_ = 0;
 	mutable std::mt19937_64 rng_;
+	mutable vector<uint8_t> prune_scratch_; // reused across RobustPrune calls
 };
 
 } // namespace aisaq

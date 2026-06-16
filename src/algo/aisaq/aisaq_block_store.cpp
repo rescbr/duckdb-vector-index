@@ -40,8 +40,25 @@ void AiSaqBlockStore::EnsureGraphCapacity(uint32_t up_to_internal_id) {
 }
 
 uint32_t AiSaqBlockStore::AllocGraphNode() {
-	EnsureGraphCapacity(graph_node_count_);
+	if (!flat_build_mode_) {
+		EnsureGraphCapacity(graph_node_count_);
+	}
 	return graph_node_count_++;
+}
+
+void AiSaqBlockStore::WriteAllGraphNodes(const uint8_t *flat, idx_t count) {
+	// Lazily allocate blocks skipped during flat-build construction.
+	if (count > 0) {
+		EnsureGraphCapacity(static_cast<uint32_t>(count - 1));
+	}
+	for (idx_t block_idx = 0; block_idx * nodes_per_block_ < count; block_idx++) {
+		D_ASSERT(block_idx < graph_block_handles_.size());
+		auto handle = buffer_manager_.Pin(graph_block_handles_[block_idx]);
+		const idx_t start_node = block_idx * nodes_per_block_;
+		const idx_t end_node = std::min(start_node + nodes_per_block_, count);
+		const idx_t bytes = (end_node - start_node) * node_size_;
+		std::memcpy(handle.Ptr(), flat + start_node * node_size_, bytes);
+	}
 }
 
 BufferHandle AiSaqBlockStore::PinGraphNode(uint32_t internal_id) const {

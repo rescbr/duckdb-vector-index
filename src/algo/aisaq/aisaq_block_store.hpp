@@ -32,8 +32,12 @@ class AiSaqBlockStore {
 	// Must be called before AllocGraphNode. Computes nodes_per_block_.
 
 	uint32_t AllocGraphNode();
-	// Allocates a new internal_id. Grows graph_block_handles_ as needed.
-	// Returns the new internal_id.
+	// Allocates a new internal_id. When flat_build_mode_ is set, skips
+	// EnsureGraphCapacity (blocks allocated lazily in WriteAllGraphNodes).
+
+	void SetFlatBuildMode(bool enabled) {
+		flat_build_mode_ = enabled;
+	}
 
 	void EnsureGraphCapacity(uint32_t up_to_internal_id);
 	// Pre-allocates blocks to hold up_to_internal_id + 1 nodes.
@@ -85,6 +89,12 @@ class AiSaqBlockStore {
 
 	// --- Persistence ---
 
+	// Bulk-write flat graph nodes from a build-time RAM buffer to block-store
+	// blocks. Called after construction when a flat node buffer was used.
+	// Creates the necessary blocks (lazily — skipped during construction
+	// when flat_build_mode_ is set) and copies the data sequentially.
+	void WriteAllGraphNodes(const uint8_t *flat, idx_t count);
+
 	// Convert all transient blocks to persistent DuckDB blocks.
 	// Called at checkpoint (SerializeToDisk). After this call, all
 	// block IDs in graph_block_ids_ and pq_page_block_ids_ are valid
@@ -105,7 +115,8 @@ class AiSaqBlockStore {
 	idx_t nodes_per_block_ = 0;
 	uint32_t graph_node_count_ = 0;
 	vector<shared_ptr<BlockHandle>> graph_block_handles_;
-	vector<block_id_t> graph_block_ids_; // persistent block IDs for serialization
+	vector<block_id_t> graph_block_ids_;
+	bool flat_build_mode_ = false;
 
 	// PQ code pages
 	idx_t code_size_ = 0;

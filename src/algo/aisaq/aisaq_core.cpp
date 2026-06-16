@@ -207,28 +207,95 @@ vector<AiSaqCore::Candidate> AiSaqCore::BeamSearch(const float *query_lut, idx_t
 }
 
 // ---------------------------------------------------------------------------
-// RobustPrune
+// RawDistance — full-precision pairwise distance for Tier 3 build
+// ---------------------------------------------------------------------------
+
+float AiSaqCore::RawDistance(const float *a, const float *b) const {
+	const idx_t dim = params_.dim;
+	switch (build_metric_) {
+	case MetricKind::L2SQ: {
+		float acc = 0.0f;
+		for (idx_t i = 0; i < dim; i++) {
+			const float d = a[i] - b[i];
+			acc += d * d;
+		}
+		return acc;
+	}
+	case MetricKind::IP: {
+		float acc = 0.0f;
+		for (idx_t i = 0; i < dim; i++) {
+			acc += a[i] * b[i];
+		}
+		return -acc; // negate so min-distance = max-similarity
+	}
+	case MetricKind::COSINE: {
+		float dot = 0.0f, na = 0.0f, nb = 0.0f;
+		for (idx_t i = 0; i < dim; i++) {
+			dot += a[i] * b[i];
+			na += a[i] * a[i];
+			nb += b[i] * b[i];
+		}
+		if (na == 0.0f || nb == 0.0f) {
+			return std::numeric_limits<float>::max();
+		}
+		return 1.0f - dot / (std::sqrt(na) * std::sqrt(nb));
+	}
+	}
+	return std::numeric_limits<float>::max();
+}
+
+// ---------------------------------------------------------------------------
+// RobustPrune — with per-prune gather (Tier 1) and flat-buffer fast paths
+// (Tier 2/3). The bitmap approach avoids vector rebuilding.
 // ---------------------------------------------------------------------------
 
 vector<AiSaqCore::Candidate> AiSaqCore::RobustPrune(const float * /*query_lut*/, vector<Candidate> candidates, idx_t R,
                                                     float alpha) const {
 	std::sort(candidates.begin(), candidates.end(),
 	          [](const Candidate &a, const Candidate &b) { return a.distance < b.distance; });
+	const idx_t n = candidates.size();
+	if (n == 0) {
+		return {};
+	}
+
+	// Tier 1: gather all candidate PQ codes into a flat local buffer.
+	// O(n) Pin calls instead of O(n²) from per-pair ReadPqCode.
+	// Tier 2/3: CodeDistance uses flat buffers directly, no gather needed.
+	vector<uint8_t> local_codes;
+	const bool need_gather = !build_codes_ && !build_vectors_;
+	if (need_gather) {
+		prune_scratch_.resize(n * code_size_);
+		for (idx_t i = 0; i < n; i++) {
+			auto ref = ReadPqCode(uint32_t(candidates[i].row_id));
+			std::memcpy(prune_scratch_.data() + i * code_size_, ref.ptr, code_size_);
+		}
+	}
+
+	vector<bool> removed(n, false);
 	vector<Candidate> kept;
-	kept.reserve(R);
-	while (!candidates.empty() && kept.size() < R) {
-		Candidate p = candidates.front();
-		kept.push_back(p);
-		vector<Candidate> remaining;
-		remaining.reserve(candidates.size());
-		for (idx_t i = 1; i < candidates.size(); i++) {
-			const auto &pp = candidates[i];
-			const float d_pp = CodeDistance(uint32_t(p.row_id), uint32_t(pp.row_id));
-			if (alpha * d_pp > pp.distance) {
-				remaining.push_back(pp);
+	kept.reserve(std::min(n, idx_t(R)));
+
+	for (idx_t p_idx = 0; p_idx < n && kept.size() < R; p_idx++) {
+		if (removed[p_idx]) {
+			continue;
+		}
+		kept.push_back(candidates[p_idx]);
+
+		for (idx_t pp_idx = p_idx + 1; pp_idx < n; pp_idx++) {
+			if (removed[pp_idx]) {
+				continue;
+			}
+			float d_pp;
+			if (need_gather) {
+				d_pp = quantizer_.CodeDistance(prune_scratch_.data() + p_idx * code_size_,
+				                                prune_scratch_.data() + pp_idx * code_size_);
+			} else {
+				d_pp = CodeDistance(uint32_t(candidates[p_idx].row_id), uint32_t(candidates[pp_idx].row_id));
+			}
+			if (alpha * d_pp <= candidates[pp_idx].distance) {
+				removed[pp_idx] = true;
 			}
 		}
-		candidates = std::move(remaining);
 	}
 	return kept;
 }
@@ -259,12 +326,37 @@ void AiSaqCore::ConnectAndPrune(uint32_t new_internal_id, const float *new_lut, 
 			continue;
 		}
 		// Overflow: re-prune s's neighbor set.
+		// Tier 1 optimization: gather s + new + all neighbor codes into a
+		// local buffer to avoid O(R²) per-pair Pin calls.
+		vector<uint8_t> local_codes;
+		const bool need_gather = !build_codes_ && !build_vectors_;
+		if (need_gather) {
+			// Layout: [0]=s_internal, [1]=new_internal_id, [2..cnt+1]=neighbors
+			local_codes.resize((idx_t(cnt) + 2) * code_size_);
+			CopyBuildCode(s_internal, local_codes.data());
+			CopyBuildCode(new_internal_id, local_codes.data() + code_size_);
+			for (uint16_t i = 0; i < cnt; i++) {
+				const uint32_t nb = GetNeighbor(sref.ptr, i);
+				CopyBuildCode(nb, local_codes.data() + idx_t(i + 2) * code_size_);
+			}
+		}
+
 		vector<Candidate> cand;
 		cand.reserve(idx_t(cnt) + 1);
-		cand.push_back({int64_t(new_internal_id), CodeDistance(s_internal, new_internal_id)});
-		for (uint16_t i = 0; i < cnt; i++) {
-			const uint32_t nb = GetNeighbor(sref.ptr, i);
-			cand.push_back({int64_t(nb), CodeDistance(s_internal, nb)});
+		if (need_gather) {
+			const_data_ptr_t s_ptr = local_codes.data();
+			cand.push_back({int64_t(new_internal_id),
+			                quantizer_.CodeDistance(s_ptr, local_codes.data() + code_size_)});
+			for (uint16_t i = 0; i < cnt; i++) {
+				cand.push_back({int64_t(GetNeighbor(sref.ptr, i)),
+				                quantizer_.CodeDistance(s_ptr, local_codes.data() + idx_t(i + 2) * code_size_)});
+			}
+		} else {
+			cand.push_back({int64_t(new_internal_id), CodeDistance(s_internal, new_internal_id)});
+			for (uint16_t i = 0; i < cnt; i++) {
+				const uint32_t nb = GetNeighbor(sref.ptr, i);
+				cand.push_back({int64_t(nb), CodeDistance(s_internal, nb)});
+			}
 		}
 		auto kept = RobustPrune(new_lut, std::move(cand), params_.R, params_.alpha);
 		SetNeighborCount(sref.ptr, uint16_t(kept.size()));
@@ -321,7 +413,8 @@ uint32_t AiSaqCore::Insert(int64_t row_id, const float *vec, int64_t label) {
 		std::memcpy(lut.data(), qpre.data(), qpre.size() * sizeof(float));
 	}
 
-	auto cands = BeamSearch(lut.data(), params_.L, 0);
+	const idx_t L_build = params_.L_build > 0 ? params_.L_build : params_.R;
+	auto cands = BeamSearch(lut.data(), L_build, 0);
 	auto selected = RobustPrune(lut.data(), std::move(cands), params_.R, params_.alpha);
 	ConnectAndPrune(internal_id, lut.data(), selected);
 

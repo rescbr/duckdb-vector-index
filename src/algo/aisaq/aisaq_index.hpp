@@ -15,6 +15,7 @@
 #include "algo/aisaq/aisaq_block_store.hpp"
 #include "algo/aisaq/aisaq_core.hpp"
 #include "vindex/index_block_store.hpp"
+#include "vindex/logging.hpp"
 #include "vindex/quantizer.hpp"
 #include "vindex/vector_index.hpp"
 
@@ -75,6 +76,30 @@ class AiSaqIndex : public VectorIndex {
 		if (core_) {
 			core_->ComputeLabelMedoids();
 		}
+	}
+
+	// --- build-time acceleration --------------------------------------------
+	// Resolve build strategy (paged/pq_buffer/exact_prune) based on
+	// dataset size, available memory, and user options. Called from Finalize.
+	void ResolveBuildStrategy(ClientContext &context, idx_t N);
+	// Populate flat PQ codes + full-precision vectors during EncodePqCodes.
+	// Activate the buffers on the core.
+	void ActivateBuildBuffers();
+	// Free build-time buffers after construction completes.
+	void ClearBuildBuffers();
+	// Flush flat graph node buffer to block store.
+	void FlushBuildNodes();
+	void SetPqEncodeProgress(atomic<idx_t> *counter) {
+		pq_encode_progress_ = counter;
+	}
+	void SetBuildLogLevel(LogLevel l) {
+		build_log_level_ = l;
+	}
+	LogLevel GetBuildLogLevel() const {
+		return build_log_level_;
+	}
+	idx_t QuantizerCodeSize() const {
+		return quantizer_ ? quantizer_->CodeSize() : 0;
 	}
 
 	void VerifyBuffers(IndexLock &lock) override;
@@ -159,6 +184,19 @@ class AiSaqIndex : public VectorIndex {
 
 	bool is_dirty = false;
 	case_insensitive_map_t<Value> stored_options_;
+
+	// Build-time acceleration buffers (Tier 2/3). Allocated in EncodePqCodes,
+	// activated on core_, freed after construction.
+	enum class BuildStrategy { PAGED, PQ_BUFFER, EXACT_PRUNE };
+	BuildStrategy build_strategy_ = BuildStrategy::PAGED;
+	vector<uint8_t> build_codes_buffer_;
+	vector<float> build_vectors_buffer_;
+	vector<uint8_t> build_nodes_buffer_;
+
+	// Build-time progress + logging.
+	atomic<idx_t> *pq_encode_progress_ = nullptr;
+	LogLevel build_log_level_ = LogLevel::OFF;
+
 	StorageLock rwlock;
 	atomic<idx_t> index_size = {0};
 

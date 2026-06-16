@@ -16,6 +16,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/storage_info.hpp"
 #include "duckdb/storage/partial_block_manager.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
@@ -23,6 +24,7 @@
 #include "algo/aisaq/aisaq_module.hpp"
 #include "vindex/vector_index_registry.hpp"
 
+#include <chrono>
 #include <cstring>
 
 namespace duckdb {
@@ -82,6 +84,14 @@ AiSaqCoreParams ParseCoreParams(const case_insensitive_map_t<Value> &options, id
 	}
 	if (p.L < p.R) {
 		p.L = p.R;
+	}
+	auto lb_it = options.find("aisaq_l_build");
+	if (lb_it != options.end()) {
+		const int64_t v = lb_it->second.GetValue<int64_t>();
+		if (v != 0 && (v < 4 || v > 1024)) {
+			throw BinderException("AiSAQ 'aisaq_l_build' out of range (4..1024, or 0 for auto=R)");
+		}
+		p.L_build = uint16_t(v);
 	}
 	auto a_it = options.find("aisaq_alpha");
 	if (a_it != options.end()) {
@@ -208,6 +218,119 @@ void AiSaqIndex::InitFromOptions(const case_insensitive_map_t<Value> &options, i
 	ParseLabelColumn(options);
 	beam_width_ = params_.beam_width;
 	core_ = make_uniq<AiSaqCore>(params_, *quantizer_, *block_store_);
+}
+
+//------------------------------------------------------------------------------
+// Build strategy resolution (Tier 1/2/3)
+//------------------------------------------------------------------------------
+
+void AiSaqIndex::ResolveBuildStrategy(ClientContext &context, idx_t N) {
+	const idx_t code_size = quantizer_->CodeSize();
+	const idx_t pq_bytes = N * code_size;
+	const idx_t fp_bytes = N * dim_ * sizeof(float);
+	const idx_t node_bytes = core_ ? N * core_->StaticNodeSize() : 0;
+
+	// Read explicit strategy from WITH options or session.
+	string strategy_str = "auto";
+	auto strat_it = stored_options_.find("build_strategy");
+	if (strat_it != stored_options_.end() && !strat_it->second.IsNull()) {
+		strategy_str = StringUtil::Lower(strat_it->second.GetValue<string>());
+	} else {
+		Value strat_val;
+		if (context.TryGetCurrentSetting("vindex_aisaq_build_strategy", strat_val)) {
+			if (!strat_val.IsNull() && strat_val.type() == LogicalType::VARCHAR) {
+				strategy_str = StringUtil::Lower(strat_val.GetValue<string>());
+			}
+		}
+	}
+
+	// Read RAM budget from WITH options or session.
+	int64_t ram_budget_mb = 0;
+	auto ram_it = stored_options_.find("ram_budget_mb");
+	if (ram_it != stored_options_.end() && !ram_it->second.IsNull()) {
+		ram_budget_mb = ram_it->second.GetValue<int64_t>();
+	} else {
+		Value ram_val;
+		if (context.TryGetCurrentSetting("vindex_aisaq_ram_budget_mb", ram_val)) {
+			if (!ram_val.IsNull() && ram_val.type() == LogicalType::BIGINT) {
+				ram_budget_mb = ram_val.GetValue<int64_t>();
+			}
+		}
+	}
+
+	// Compute budget in bytes.
+	idx_t budget;
+	if (ram_budget_mb > 0) {
+		budget = idx_t(ram_budget_mb) * 1024 * 1024;
+	} else {
+		auto &bm = BufferManager::GetBufferManager(context);
+		idx_t max_mem = bm.GetMaxMemory();
+		if (max_mem == idx_t(-1)) {
+			budget = 1024 * 1024 * 1024; // 1 GB default for unlimited memory
+		} else {
+			budget = max_mem / 4; // 25% of memory_limit
+		}
+	}
+
+	// Resolve strategy.
+	if (strategy_str == "exact_prune") {
+		build_strategy_ = BuildStrategy::EXACT_PRUNE;
+	} else if (strategy_str == "pq_buffer") {
+		build_strategy_ = BuildStrategy::PQ_BUFFER;
+	} else if (strategy_str == "paged") {
+		build_strategy_ = BuildStrategy::PAGED;
+	} else {
+		// auto: prefer pq_buffer (best speed/recall balance). exact_prune is opt-in only.
+		if (pq_bytes + node_bytes <= budget) {
+			build_strategy_ = BuildStrategy::PQ_BUFFER;
+		} else {
+			build_strategy_ = BuildStrategy::PAGED;
+		}
+	}
+}
+
+void AiSaqIndex::ActivateBuildBuffers() {
+	if (!core_) {
+		return;
+	}
+	if (!build_codes_buffer_.empty()) {
+		core_->SetBuildCodes(build_codes_buffer_.data(), build_codes_buffer_.size() / quantizer_->CodeSize());
+	}
+	if (!build_vectors_buffer_.empty()) {
+		core_->SetBuildVectors(build_vectors_buffer_.data(), dim_, metric_);
+	}
+	// Tier 2+: allocate flat graph node buffer so PinNode skips BufferManager.
+	if (build_strategy_ != BuildStrategy::PAGED) {
+		const idx_t node_size = core_->StaticNodeSize();
+		const idx_t N = quantizer_->CodeSize() > 0
+		                    ? build_codes_buffer_.size() / quantizer_->CodeSize()
+		                    : 0;
+		if (N > 0) {
+			build_nodes_buffer_.assign(N * node_size, 0);
+			core_->SetBuildNodes(build_nodes_buffer_.data());
+			block_store_->SetFlatBuildMode(true);
+			core_->PrepareForBuild(N);
+		}
+	}
+}
+
+void AiSaqIndex::ClearBuildBuffers() {
+	if (core_) {
+		core_->ClearBuildBuffers();
+	}
+	build_codes_buffer_.clear();
+	build_codes_buffer_.shrink_to_fit();
+	build_vectors_buffer_.clear();
+	build_vectors_buffer_.shrink_to_fit();
+	build_nodes_buffer_.clear();
+	build_nodes_buffer_.shrink_to_fit();
+}
+
+void AiSaqIndex::FlushBuildNodes() {
+	if (!build_nodes_buffer_.empty() && block_store_) {
+		block_store_->SetFlatBuildMode(false);
+		block_store_->WriteAllGraphNodes(build_nodes_buffer_.data(), block_store_->GraphNodeCount());
+	}
 }
 
 AiSaqIndex::AiSaqIndex(const string &name, IndexConstraintType index_constraint_type,
@@ -433,10 +556,41 @@ void AiSaqIndex::EncodePqCodes(ColumnDataCollection &collection) {
 	auto lock = rwlock.GetExclusiveLock();
 	const idx_t code_size = quantizer_->CodeSize();
 	const idx_t codes_per_page = block_store_->CodesPerPage();
+	const idx_t N = collection.Count();
+
+	// Tier 2/3: allocate flat PQ code buffer if strategy requires it.
+	const bool use_pq_buffer = (build_strategy_ != BuildStrategy::PAGED);
+	const bool use_fp_buffer = (build_strategy_ == BuildStrategy::EXACT_PRUNE);
+	if (use_pq_buffer) {
+		build_codes_buffer_.resize(N * code_size);
+	}
+	if (use_fp_buffer) {
+		build_vectors_buffer_.resize(N * dim_);
+	}
+
+	if (LogInfo(build_log_level_)) {
+		const char *strat_name = build_strategy_ == BuildStrategy::EXACT_PRUNE ? "exact_prune"
+		                    : build_strategy_ == BuildStrategy::PQ_BUFFER     ? "pq_buffer"
+		                    : "paged";
+		fprintf(stderr, "[vindex] AiSAQ build: strategy=%s, N=%llu, pq_buffer=%lluMB",
+		        strat_name, (unsigned long long)N,
+		        (unsigned long long)(N * code_size / (1024 * 1024)));
+		if (use_pq_buffer) {
+			fprintf(stderr, ", node_buffer=%lluMB",
+			        (unsigned long long)(N * core_->StaticNodeSize() / (1024 * 1024)));
+		}
+		if (use_fp_buffer) {
+			fprintf(stderr, ", fp_buffer=%lluMB", (unsigned long long)(N * dim_ * 4 / (1024 * 1024)));
+		}
+		fprintf(stderr, "\n");
+		fprintf(stderr, "[vindex] PQ encoding: 0/%llu\n", (unsigned long long)N);
+	}
 
 	vector<data_t> page(codes_per_page * code_size, 0);
 	uint32_t page_idx = 0;
 	idx_t slot = 0;
+	idx_t global_slot = 0;
+	auto last_log = std::chrono::steady_clock::now();
 
 	DataChunk scan_chunk;
 	collection.InitializeScanChunk(scan_chunk);
@@ -459,7 +613,17 @@ void AiSaqIndex::EncodePqCodes(ColumnDataCollection &collection) {
 			} else {
 				quantizer_->Encode(vec_child_data + i * array_size, page.data() + slot * code_size);
 			}
+			// Copy to flat build buffers (Tier 2/3).
+			if (use_pq_buffer) {
+				std::memcpy(build_codes_buffer_.data() + global_slot * code_size,
+				            page.data() + slot * code_size, code_size);
+			}
+			if (use_fp_buffer) {
+				std::memcpy(build_vectors_buffer_.data() + global_slot * dim_,
+				            vec_child_data + i * array_size, dim_ * sizeof(float));
+			}
 			slot++;
+			global_slot++;
 			if (slot >= codes_per_page) {
 				block_store_->WritePqPage(page_idx, page.data());
 				page_idx++;
@@ -467,9 +631,23 @@ void AiSaqIndex::EncodePqCodes(ColumnDataCollection &collection) {
 				std::memset(page.data(), 0, page.size());
 			}
 		}
+		if (pq_encode_progress_) {
+			pq_encode_progress_->store(global_slot);
+		}
+		if (LogInfo(build_log_level_)) {
+			auto now = std::chrono::steady_clock::now();
+			if (now - last_log > std::chrono::seconds(2)) {
+				fprintf(stderr, "[vindex] PQ encoding: %llu/%llu (%.0f%%)\n", (unsigned long long)global_slot,
+				        (unsigned long long)N, 100.0 * double(global_slot) / double(N));
+				last_log = now;
+			}
+		}
 	}
 	if (slot > 0) {
 		block_store_->WritePqPage(page_idx, page.data());
+	}
+	if (pq_encode_progress_) {
+		pq_encode_progress_->store(global_slot);
 	}
 }
 
@@ -763,6 +941,18 @@ void RegisterIndex(DatabaseInstance &db) {
 	if (!db.config.GetOptionByName("vindex_aisaq_l_search")) {
 		db.config.AddExtensionOption("vindex_aisaq_l_search", "override the AiSAQ beam width (L_search) when scanning",
 		                             LogicalType::BIGINT);
+	}
+	if (!db.config.GetOptionByName("vindex_aisaq_build_strategy")) {
+		db.config.AddExtensionOption(
+		    "vindex_aisaq_build_strategy",
+		    "AiSAQ build acceleration: 'auto' (default), 'paged', 'pq_buffer', 'exact_prune' (slow, best quality)",
+		    LogicalType::VARCHAR, Value("auto"));
+	}
+	if (!db.config.GetOptionByName("vindex_aisaq_ram_budget_mb")) {
+		db.config.AddExtensionOption(
+		    "vindex_aisaq_ram_budget_mb",
+		    "RAM budget in MB for AiSAQ build-time buffers (0 = auto = 25%% of memory_limit)",
+		    LogicalType::BIGINT, Value::BIGINT(0));
 	}
 
 	db.config.GetIndexTypes().RegisterIndexType(index_type);

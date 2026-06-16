@@ -308,7 +308,8 @@ static idx_t ResolveLSearch(ClientContext &context, idx_t fallback) {
 	return fallback;
 }
 
-unique_ptr<IndexScanState> AiSaqIndex::InitializeScan(float *query_vector, idx_t limit, ClientContext &context) {
+unique_ptr<IndexScanState> AiSaqIndex::InitializeScan(float *query_vector, idx_t limit, ClientContext &context,
+                                                      const LabelFilter &label_filter) {
 	auto state = make_uniq<AiSaqIndexScanState>();
 	const idx_t L_search = ResolveLSearch(context, params_.L);
 
@@ -319,7 +320,7 @@ unique_ptr<IndexScanState> AiSaqIndex::InitializeScan(float *query_vector, idx_t
 
 	auto lock = rwlock.GetSharedLock();
 	const idx_t oversample = limit + tombstones_.size();
-	auto cands = core_->Search(lut.data(), oversample, L_search, beam_width_, io_limit_);
+	auto cands = core_->Search(lut.data(), oversample, L_search, beam_width_, io_limit_, label_filter);
 
 	vector<row_t> hits;
 	hits.reserve(limit);
@@ -471,7 +472,7 @@ void AiSaqIndex::EncodePqCodes(ColumnDataCollection &collection) {
 	}
 }
 
-void AiSaqIndex::Construct(DataChunk &input, Vector &row_ids, idx_t /*thread_idx*/) {
+void AiSaqIndex::Construct(DataChunk &input, Vector &row_ids, idx_t /*thread_idx*/, Vector *labels) {
 	D_ASSERT(row_ids.GetType().InternalType() == ROW_TYPE);
 	D_ASSERT(logical_types[0] == input.data[0].GetType());
 	is_dirty = true;
@@ -483,6 +484,11 @@ void AiSaqIndex::Construct(DataChunk &input, Vector &row_ids, idx_t /*thread_idx
 	const auto array_size = ArrayType::GetSize(vec_vec.GetType());
 	auto vec_child_data = FlatVector::GetData<float>(vec_child_vec);
 	auto rowid_data = FlatVector::GetData<row_t>(row_ids);
+	const int64_t *label_data = nullptr;
+	if (labels) {
+		labels->Flatten(count);
+		label_data = FlatVector::GetData<int64_t>(*labels);
+	}
 
 	auto lock = rwlock.GetExclusiveLock();
 	for (idx_t i = 0; i < count; i++) {
@@ -494,7 +500,8 @@ void AiSaqIndex::Construct(DataChunk &input, Vector &row_ids, idx_t /*thread_idx
 		if (tomb_it != tombstones_.end()) {
 			tombstones_.erase(tomb_it);
 		}
-		const uint32_t internal_id = core_->Insert(int64_t(rowid), vec_child_data + (i * array_size));
+		const int64_t label = (label_data && !FlatVector::IsNull(*labels, i)) ? label_data[i] : INT64_MIN;
+		const uint32_t internal_id = core_->Insert(int64_t(rowid), vec_child_data + (i * array_size), label);
 		row_to_internal_[rowid] = internal_id;
 	}
 	index_size = core_->Size();

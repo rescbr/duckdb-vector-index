@@ -17,6 +17,7 @@
 
 #include "algo/aisaq/aisaq_block_store.hpp"
 #include "algo/aisaq/aisaq_core.hpp"
+#include "vindex/label_filter.hpp"
 #include "vindex/metric.hpp"
 #include "vindex/pq_quantizer.hpp"
 #include "vindex/quantizer.hpp"
@@ -33,6 +34,7 @@ using duckdb::BufferManager;
 using duckdb::DatabaseManager;
 using duckdb::DuckDB;
 using duckdb::idx_t;
+using duckdb::vindex::LabelFilter;
 using duckdb::vindex::MetricKind;
 using duckdb::vindex::QuantizerKind;
 using duckdb::vindex::aisaq::AiSaqBlockStore;
@@ -291,5 +293,179 @@ TEST_CASE("AiSaqCore SerializeState round-trip preserves search results", "[aisa
 	for (idx_t i = 0; i < before.size(); i++) {
 		REQUIRE(after[i].row_id == before[i].row_id);
 		REQUIRE(std::fabs(after[i].distance - before[i].distance) < 1e-4f);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: label-filter tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AiSaqCore EQUALS label filter returns only matching-label results", "[aisaq_core][unit]") {
+	MemoryDB mem;
+	AiSaqBlockStore store(*mem.bm, *mem.bufmgr);
+
+	constexpr idx_t N = 300;
+	constexpr idx_t D = 16;
+	constexpr uint8_t M = 4;
+	constexpr uint8_t BITS = 8;
+
+	// Generate data: 3 clusters of 100 vectors, one per label.
+	auto data = RandomGaussian(N, D, 0xCAFEu);
+	// Shift clusters apart.
+	for (idx_t i = 0; i < N; i++) {
+		const int64_t label = int64_t(i / 100) + 1;
+		const float offset = float(label) * 1000.0f;
+		for (idx_t j = 0; j < D; j++) {
+			data[i * D + j] += offset;
+		}
+	}
+
+	PqQuantizer quant(MetricKind::L2SQ, D, M, BITS, 42);
+	quant.Train(data.data(), N, D);
+
+	AiSaqCoreParams params;
+	params.dim = D;
+	params.R = 32;
+	params.L = 100;
+	params.n_entry_points = 8;
+	params.seed = 7;
+
+	AiSaqCore core(params, quant, store);
+	WriteAllPqCodes(store, quant, data.data(), N, D);
+	for (idx_t i = 0; i < N; i++) {
+		const int64_t label = int64_t(i / 100) + 1;
+		core.Insert(int64_t(i), data.data() + i * D, label);
+	}
+	REQUIRE(core.Size() == N);
+	core.ComputeEntryPoints();
+	core.ComputeLabelMedoids();
+	REQUIRE(core.HasLabels());
+
+	// Query from label 2 cluster center.
+	std::vector<float> query(D, 2000.0f);
+	std::vector<float> qpre(quant.QueryWorkspaceSize());
+	quant.PreprocessQuery(query.data(), qpre.data());
+	std::vector<float> lut(quant.LUTSize());
+	quant.PopulateDistanceLUT(qpre.data(), lut.data());
+
+	// EQUALS filter: all results must have label == 2.
+	auto res = core.Search(lut.data(), 10, params.L, 8, 0, LabelFilter::Equals(2));
+	REQUIRE(!res.empty());
+	for (const auto &c : res) {
+		REQUIRE(c.row_id >= 100);
+		REQUIRE(c.row_id < 200);
+	}
+
+	// Nonexistent label: empty.
+	auto res_empty = core.Search(lut.data(), 10, params.L, 8, 0, LabelFilter::Equals(999));
+	REQUIRE(res_empty.empty());
+}
+
+TEST_CASE("AiSaqCore RANGE label filter respects bounds", "[aisaq_core][unit]") {
+	MemoryDB mem;
+	AiSaqBlockStore store(*mem.bm, *mem.bufmgr);
+
+	constexpr idx_t N = 300;
+	constexpr idx_t D = 16;
+	constexpr uint8_t M = 4;
+	constexpr uint8_t BITS = 8;
+
+	auto data = RandomGaussian(N, D, 0xF00Du);
+	for (idx_t i = 0; i < N; i++) {
+		const int64_t label = int64_t(i / 100) + 1;
+		const float offset = float(label) * 1000.0f;
+		for (idx_t j = 0; j < D; j++) {
+			data[i * D + j] += offset;
+		}
+	}
+
+	PqQuantizer quant(MetricKind::L2SQ, D, M, BITS, 42);
+	quant.Train(data.data(), N, D);
+
+	AiSaqCoreParams params;
+	params.dim = D;
+	params.R = 32;
+	params.L = 100;
+	params.n_entry_points = 16;
+	params.seed = 7;
+
+	AiSaqCore core(params, quant, store);
+	WriteAllPqCodes(store, quant, data.data(), N, D);
+	for (idx_t i = 0; i < N; i++) {
+		const int64_t label = int64_t(i / 100) + 1;
+		core.Insert(int64_t(i), data.data() + i * D, label);
+	}
+	core.ComputeEntryPoints();
+	core.ComputeLabelMedoids();
+
+	// RANGE(1, 2): all results must have label in {1, 2}.
+	std::vector<float> query(D, 1500.0f);
+	std::vector<float> qpre(quant.QueryWorkspaceSize());
+	quant.PreprocessQuery(query.data(), qpre.data());
+	std::vector<float> lut(quant.LUTSize());
+	quant.PopulateDistanceLUT(qpre.data(), lut.data());
+
+	auto res = core.Search(lut.data(), 10, params.L, 8, 0, LabelFilter::Range(1, 2));
+	REQUIRE(!res.empty());
+	for (const auto &c : res) {
+		REQUIRE(c.row_id < 200); // labels 1 and 2 cover row_ids 0..199
+	}
+
+	// Count labels in range.
+	REQUIRE(core.CountLabelsInRange(1, 3) == 3);
+	REQUIRE(core.CountLabelsInRange(1, 2) == 2);
+	REQUIRE(core.CountLabelsInRange(2, 2) == 1);
+	REQUIRE(core.CountLabelsInRange(1, 100) == 3);
+}
+
+TEST_CASE("AiSaqCore SerializeState preserves label maps", "[aisaq_core][unit]") {
+	MemoryDB mem;
+	AiSaqBlockStore store(*mem.bm, *mem.bufmgr);
+
+	constexpr idx_t N = 100;
+	constexpr idx_t D = 16;
+	constexpr uint8_t M = 4;
+	constexpr uint8_t BITS = 8;
+
+	auto data = RandomGaussian(N, D, 0xBEEFu);
+	PqQuantizer quant(MetricKind::L2SQ, D, M, BITS, 42);
+	quant.Train(data.data(), N, D);
+
+	AiSaqCoreParams params;
+	params.dim = D;
+	params.R = 16;
+	params.L = 64;
+	params.n_entry_points = 4;
+	params.seed = 5;
+
+	AiSaqCore core(params, quant, store);
+	WriteAllPqCodes(store, quant, data.data(), N, D);
+	for (idx_t i = 0; i < N; i++) {
+		const int64_t label = int64_t(i / 25) + 1; // 4 labels, 25 per
+		core.Insert(int64_t(i), data.data() + i * D, label);
+	}
+	core.ComputeEntryPoints();
+	core.ComputeLabelMedoids();
+
+	// Search with EQUALS before serialize.
+	std::vector<float> query(D, 0.0f);
+	std::vector<float> qpre(quant.QueryWorkspaceSize());
+	quant.PreprocessQuery(query.data(), qpre.data());
+	std::vector<float> lut(quant.LUTSize());
+	quant.PopulateDistanceLUT(qpre.data(), lut.data());
+	auto before = core.Search(lut.data(), 5, params.L, 8, 0, LabelFilter::Equals(2));
+
+	duckdb::vector<duckdb::data_t> blob;
+	core.SerializeState(blob);
+
+	AiSaqCore core2(params, quant, store);
+	core2.DeserializeState(blob.data(), blob.size());
+	REQUIRE(core2.HasLabels());
+	REQUIRE(core2.CountLabelsInRange(1, 4) == 4);
+
+	auto after = core2.Search(lut.data(), 5, params.L, 8, 0, LabelFilter::Equals(2));
+	REQUIRE(after.size() == before.size());
+	for (idx_t i = 0; i < before.size(); i++) {
+		REQUIRE(after[i].row_id == before[i].row_id);
 	}
 }

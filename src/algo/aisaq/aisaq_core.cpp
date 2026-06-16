@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <queue>
 
 namespace duckdb {
@@ -13,6 +14,7 @@ namespace aisaq {
 namespace {
 
 constexpr uint64_t kStateMagicV1 = 0x3156534141494756ULL; // "VGIASV1"
+constexpr uint64_t kStateMagicV2 = 0x3256534141494756ULL; // "VGIASV2" — adds label maps
 
 // Min-heap frontier (pop closest first).
 struct FrontierItem {
@@ -93,7 +95,9 @@ uint32_t AiSaqCore::PickEntryPoint(const float *query_lut) const {
 // BeamSearch
 // ---------------------------------------------------------------------------
 
-vector<AiSaqCore::Candidate> AiSaqCore::BeamSearch(const float *query_lut, idx_t L, idx_t io_limit) const {
+vector<AiSaqCore::Candidate> AiSaqCore::BeamSearch(const float *query_lut, idx_t L, idx_t io_limit,
+                                                    const vector<uint32_t> *forced_entry_points,
+                                                    const LabelFilter *label_filter) const {
 	vector<Candidate> out;
 	if (size_ == 0 || L == 0) {
 		return out;
@@ -112,20 +116,40 @@ vector<AiSaqCore::Candidate> AiSaqCore::BeamSearch(const float *query_lut, idx_t
 
 	uint32_t io_count = 0;
 
-	const uint32_t entry_internal = PickEntryPoint(query_lut);
-	if (entry_internal >= visit_marks_.size()) {
-		visit_marks_.resize(std::max<size_t>(visit_marks_.size() * 2, size_t(entry_internal) + 1), 0);
+	// Seed entry points.
+	if (forced_entry_points && !forced_entry_points->empty()) {
+		for (uint32_t ep_id : *forced_entry_points) {
+			if (ep_id >= visit_marks_.size()) {
+				visit_marks_.resize(std::max<size_t>(visit_marks_.size() * 2, size_t(ep_id) + 1), 0);
+			}
+			if (visit_marks_[ep_id] == vc) {
+				continue;
+			}
+			visit_marks_[ep_id] = vc;
+			io_count++;
+			const float d = DistanceToCode(query_lut, ep_id);
+			frontier.push({d, ep_id});
+			W.push({d, ep_id});
+			if (W.size() > L) {
+				W.pop();
+			}
+		}
+	} else {
+		const uint32_t entry_internal = PickEntryPoint(query_lut);
+		if (entry_internal >= visit_marks_.size()) {
+			visit_marks_.resize(
+			    std::max<size_t>(visit_marks_.size() * 2, size_t(entry_internal) + 1), 0);
+		}
+		visit_marks_[entry_internal] = vc;
+		io_count++;
+		const float entry_dist = DistanceToCode(query_lut, entry_internal);
+		frontier.push({entry_dist, entry_internal});
+		W.push({entry_dist, entry_internal});
 	}
-	visit_marks_[entry_internal] = vc;
-	if (io_limit > 0 && io_count >= io_limit) {
-		// Even under a 0-budget cap we must seed the search from the entry.
-		out.push_back({int64_t(entry_internal), DistanceToCode(query_lut, entry_internal)});
+
+	if (frontier.empty()) {
 		return out;
 	}
-	io_count++;
-	const float entry_dist = DistanceToCode(query_lut, entry_internal);
-	frontier.push({entry_dist, entry_internal});
-	W.push({entry_dist, entry_internal});
 
 	while (!frontier.empty()) {
 		const auto best = frontier.top();
@@ -145,6 +169,17 @@ vector<AiSaqCore::Candidate> AiSaqCore::BeamSearch(const float *query_lut, idx_t
 				continue;
 			}
 			visit_marks_[nb_internal] = vc;
+
+			// Label filtering: skip neighbors whose label doesn't match.
+			if (label_filter && label_filter->IsActive()) {
+				auto it = internal_id_to_label_.find(nb_internal);
+				if (it != internal_id_to_label_.end()) {
+					if (!label_filter->Matches(it->second)) {
+						continue;
+					}
+				}
+			}
+
 			if (io_limit > 0 && io_count >= io_limit) {
 				continue; // out of I/O budget: mark visited, skip distance.
 			}
@@ -243,7 +278,7 @@ void AiSaqCore::ConnectAndPrune(uint32_t new_internal_id, const float *new_lut, 
 // Insert
 // ---------------------------------------------------------------------------
 
-uint32_t AiSaqCore::Insert(int64_t row_id, const float *vec) {
+uint32_t AiSaqCore::Insert(int64_t row_id, const float *vec, int64_t label) {
 	const uint32_t internal_id = store_.AllocGraphNode();
 
 	{
@@ -259,6 +294,12 @@ uint32_t AiSaqCore::Insert(int64_t row_id, const float *vec) {
 
 	if (internal_id >= visit_marks_.size()) {
 		visit_marks_.resize(std::max<size_t>(visit_marks_.size() * 2, size_t(internal_id) + 1), 0);
+	}
+
+	// Label bookkeeping.
+	if (label != INT64_MIN) {
+		internal_id_to_label_[internal_id] = label;
+		label_to_internal_ids_[label].push_back(internal_id);
 	}
 
 	if (size_ == 0) {
@@ -331,11 +372,99 @@ void AiSaqCore::ComputeEntryPoints() {
 }
 
 // ---------------------------------------------------------------------------
-// Search
+// ComputeLabelMedoids
+// ---------------------------------------------------------------------------
+
+void AiSaqCore::ComputeLabelMedoids() {
+	if (label_to_internal_ids_.empty()) {
+		return;
+	}
+
+	// Build sorted_labels_ for range queries.
+	sorted_labels_.clear();
+	sorted_labels_.reserve(label_to_internal_ids_.size());
+	for (const auto &kv : label_to_internal_ids_) {
+		sorted_labels_.push_back(kv.first);
+	}
+	std::sort(sorted_labels_.begin(), sorted_labels_.end());
+
+	// For each label, find the medoid: the member whose PQ code is closest
+	// to the label's centroid (approximated by averaging member codes).
+	label_medoids_.clear();
+	for (const auto &kv : label_to_internal_ids_) {
+		const auto &members = kv.second;
+		if (members.empty()) {
+			continue;
+		}
+		if (members.size() == 1) {
+			label_medoids_[kv.first] = members[0];
+			continue;
+		}
+
+		// Compute centroid by averaging PQ codes.
+		vector<float> centroid(code_size_, 0.0f);
+		for (uint32_t mid : members) {
+			auto ref = ReadPqCode(mid);
+			for (idx_t j = 0; j < code_size_; j++) {
+				centroid[j] += float(ref.ptr[j]);
+			}
+		}
+		const float inv = 1.0f / float(members.size());
+		for (idx_t j = 0; j < code_size_; j++) {
+			centroid[j] *= inv;
+		}
+
+		// Find the member closest to the centroid (by L2 on PQ codes).
+		uint32_t best_id = members[0];
+		float best_dist = std::numeric_limits<float>::max();
+		for (uint32_t mid : members) {
+			auto ref = ReadPqCode(mid);
+			float d = 0.0f;
+			for (idx_t j = 0; j < code_size_; j++) {
+				const float diff = float(ref.ptr[j]) - centroid[j];
+				d += diff * diff;
+			}
+			if (d < best_dist) {
+				best_dist = d;
+				best_id = mid;
+			}
+		}
+		label_medoids_[kv.first] = best_id;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Range-query helpers
+// ---------------------------------------------------------------------------
+
+idx_t AiSaqCore::CountLabelsInRange(int64_t lo, int64_t hi) const {
+	if (sorted_labels_.empty()) {
+		return 0;
+	}
+	auto lower = std::lower_bound(sorted_labels_.begin(), sorted_labels_.end(), lo);
+	auto upper = std::upper_bound(sorted_labels_.begin(), sorted_labels_.end(), hi);
+	return idx_t(upper - lower);
+}
+
+vector<uint32_t> AiSaqCore::GetMedoidsInRange(int64_t lo, int64_t hi, idx_t max_count) const {
+	vector<uint32_t> result;
+	auto lower = std::lower_bound(sorted_labels_.begin(), sorted_labels_.end(), lo);
+	auto upper = std::upper_bound(sorted_labels_.begin(), sorted_labels_.end(), hi);
+	for (auto it = lower; it != upper; ++it) {
+		auto mit = label_medoids_.find(*it);
+		if (mit != label_medoids_.end()) {
+			result.push_back(mit->second);
+		}
+		if (result.size() >= max_count) {
+			break;
+		}
+	}
+	return result;
+}
 // ---------------------------------------------------------------------------
 
 vector<AiSaqCore::Candidate> AiSaqCore::Search(const float *query_lut, idx_t k, idx_t L_search, idx_t /*beam_width*/,
-                                               idx_t io_limit) const {
+                                               idx_t io_limit, const LabelFilter &label_filter) const {
 	if (size_ == 0 || k == 0) {
 		return {};
 	}
@@ -345,7 +474,34 @@ vector<AiSaqCore::Candidate> AiSaqCore::Search(const float *query_lut, idx_t k, 
 	if (L_search < k) {
 		L_search = k;
 	}
-	auto cands = BeamSearch(query_lut, L_search, io_limit);
+
+	vector<Candidate> cands;
+	const LabelFilter *lf = label_filter.IsActive() ? &label_filter : nullptr;
+
+	if (lf && lf->kind == LabelFilter::Kind::EQUALS) {
+		// EQUALS: use the label's medoid as the single entry point.
+		auto it = label_medoids_.find(lf->value);
+		if (it == label_medoids_.end()) {
+			return {}; // no vectors with this label
+		}
+		vector<uint32_t> ep = {it->second};
+		cands = BeamSearch(query_lut, L_search, io_limit, &ep, lf);
+	} else if (lf && lf->kind == LabelFilter::Kind::RANGE) {
+		// RANGE: adaptive strategy.
+		const idx_t match_count = CountLabelsInRange(lf->lo, lf->hi);
+		if (match_count > 0 && match_count <= params_.n_entry_points) {
+			// Multi-medoid: use all matching medoids as entry points.
+			auto eps = GetMedoidsInRange(lf->lo, lf->hi, params_.n_entry_points);
+			cands = BeamSearch(query_lut, L_search, io_limit, &eps, lf);
+		} else {
+			// Too many labels or none: fall back to global entry points.
+			cands = BeamSearch(query_lut, L_search, io_limit, nullptr, lf);
+		}
+	} else {
+		// No label filter or unsupported kind: normal search.
+		cands = BeamSearch(query_lut, L_search, io_limit, nullptr, lf);
+	}
+
 	if (cands.size() > k) {
 		cands.resize(k);
 	}
@@ -381,7 +537,7 @@ template <typename T> T Consume(const_data_ptr_t &cur, const_data_ptr_t end) {
 } // namespace
 
 void AiSaqCore::SerializeState(vector<data_t> &out) const {
-	Append<uint64_t>(out, kStateMagicV1);
+	Append<uint64_t>(out, kStateMagicV2);
 	Append<uint64_t>(out, uint64_t(params_.dim));
 	Append<uint16_t>(out, params_.R);
 	Append<uint16_t>(out, params_.L);
@@ -402,6 +558,17 @@ void AiSaqCore::SerializeState(vector<data_t> &out) const {
 			out.insert(out.end(), ep.code.begin(), ep.code.end());
 		}
 	}
+
+	// Label maps (V2).
+	Append<uint64_t>(out, uint64_t(label_to_internal_ids_.size()));
+	for (const auto &kv : label_to_internal_ids_) {
+		Append<int64_t>(out, kv.first);
+		Append<uint32_t>(out, label_medoids_.count(kv.first) ? label_medoids_.at(kv.first) : 0);
+		Append<uint32_t>(out, uint32_t(kv.second.size()));
+		for (uint32_t mid : kv.second) {
+			Append<uint32_t>(out, mid);
+		}
+	}
 }
 
 void AiSaqCore::DeserializeState(const_data_ptr_t in, idx_t size) {
@@ -409,7 +576,7 @@ void AiSaqCore::DeserializeState(const_data_ptr_t in, idx_t size) {
 	const_data_ptr_t end = in + size;
 
 	const auto magic = Consume<uint64_t>(cur, end);
-	if (magic != kStateMagicV1) {
+	if (magic != kStateMagicV1 && magic != kStateMagicV2) {
 		throw InternalException("AiSaqCore: unrecognized state stream (magic mismatch)");
 	}
 	const auto dim = Consume<uint64_t>(cur, end);
@@ -451,6 +618,37 @@ void AiSaqCore::DeserializeState(const_data_ptr_t in, idx_t size) {
 			cur += clen;
 		}
 		entry_points_.push_back(std::move(ep));
+	}
+
+	// Label maps (V2 only).
+	label_to_internal_ids_.clear();
+	internal_id_to_label_.clear();
+	label_medoids_.clear();
+	sorted_labels_.clear();
+	if (magic == kStateMagicV2) {
+		const auto n_labels = Consume<uint64_t>(cur, end);
+		for (uint64_t i = 0; i < n_labels; i++) {
+			const auto label = Consume<int64_t>(cur, end);
+			const auto medoid = Consume<uint32_t>(cur, end);
+			const auto n_members = Consume<uint32_t>(cur, end);
+			vector<uint32_t> members(n_members);
+			for (uint32_t j = 0; j < n_members; j++) {
+				members[j] = Consume<uint32_t>(cur, end);
+			}
+			for (uint32_t mid : members) {
+				internal_id_to_label_[mid] = label;
+			}
+			label_to_internal_ids_[label] = std::move(members);
+			if (medoid != 0 || n_members > 0) {
+				label_medoids_[label] = medoid;
+			}
+		}
+		// Rebuild sorted_labels_.
+		sorted_labels_.reserve(label_to_internal_ids_.size());
+		for (const auto &kv : label_to_internal_ids_) {
+			sorted_labels_.push_back(kv.first);
+		}
+		std::sort(sorted_labels_.begin(), sorted_labels_.end());
 	}
 
 	visit_marks_.assign(size_, 0);

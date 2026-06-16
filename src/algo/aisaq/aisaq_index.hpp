@@ -39,7 +39,12 @@ class AiSaqIndex : public VectorIndex {
 	idx_t GetVectorSize() const override;
 	idx_t GetRerankMultiple(ClientContext &context) const override;
 
-	unique_ptr<IndexScanState> InitializeScan(float *query_vector, idx_t limit, ClientContext &context) override;
+	bool SupportsLabelFilter() const override {
+		return !label_column_.empty();
+	}
+
+	unique_ptr<IndexScanState> InitializeScan(float *query_vector, idx_t limit, ClientContext &context,
+	                                           const LabelFilter &label_filter) override;
 	idx_t Scan(IndexScanState &state, Vector &result, idx_t result_offset = 0) override;
 
 	unique_ptr<IndexScanState> InitializeMultiScan(ClientContext &context) override;
@@ -48,7 +53,7 @@ class AiSaqIndex : public VectorIndex {
 	void ResetMultiScan(IndexScanState &state) override;
 
 	// --- AiSAQ-specific ------------------------------------------------------
-	void Construct(DataChunk &input, Vector &row_ids, idx_t thread_idx);
+	void Construct(DataChunk &input, Vector &row_ids, idx_t thread_idx, Vector *labels = nullptr);
 	void Compact() override;
 
 	void TrainQuantizer(ColumnDataCollection &collection, idx_t sample_cap = 65536);
@@ -64,6 +69,11 @@ class AiSaqIndex : public VectorIndex {
 	void ComputeEntryPoints() {
 		if (core_) {
 			core_->ComputeEntryPoints();
+		}
+	}
+	void ComputeLabelMedoids() {
+		if (core_) {
+			core_->ComputeLabelMedoids();
 		}
 	}
 

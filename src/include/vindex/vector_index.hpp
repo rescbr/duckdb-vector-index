@@ -72,8 +72,11 @@ public:
 
 	// --- single-query scan (scan / topk optimizers) --------------------------
 	// Returns a state that yields up to `limit` approximate-nearest-neighbour
-	// row_ids via repeated Scan() calls.
-	virtual unique_ptr<IndexScanState> InitializeScan(float *query_vector, idx_t limit, ClientContext &context) = 0;
+	// row_ids via repeated Scan() calls. The label_filter is active only when
+	// SupportsLabelFilter() returns true and the optimizer extracted a predicate
+	// on the designated label column.
+	virtual unique_ptr<IndexScanState> InitializeScan(float *query_vector, idx_t limit, ClientContext &context,
+	                                                   const LabelFilter &label_filter = LabelFilter::None()) = 0;
 	virtual idx_t Scan(IndexScanState &state, Vector &result, idx_t result_offset = 0) = 0;
 
 	// --- multi-query scan (join optimizer) -----------------------------------

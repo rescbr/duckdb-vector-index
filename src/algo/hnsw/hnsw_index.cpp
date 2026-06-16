@@ -385,7 +385,8 @@ static idx_t ResolveEfSearch(ClientContext &context, idx_t fallback) {
 	return fallback;
 }
 
-unique_ptr<IndexScanState> HnswIndex::InitializeScan(float *query_vector, idx_t limit, ClientContext &context) {
+unique_ptr<IndexScanState> HnswIndex::InitializeScan(float *query_vector, idx_t limit, ClientContext &context,
+                                                      const LabelFilter & /*label_filter*/) {
 	auto state = make_uniq<HnswIndexScanState>();
 	const idx_t ef_search = ResolveEfSearch(context, params_.ef_search);
 

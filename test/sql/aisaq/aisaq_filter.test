@@ -1,0 +1,104 @@
+# AiSAQ label-column filtering — Phase 6.
+#
+# Exercises:
+#   - CREATE INDEX ... WITH (label_column='cat')
+#   - WHERE cat = X (EQUALS) routes through VINDEX_INDEX_SCAN
+#   - WHERE cat > X, >=, <, <=, BETWEEN (RANGE) routes through VINDEX_INDEX_SCAN
+#   - Folded conjuncts (cat > 1 AND cat < 3) route as a single RANGE
+#   - Filtered queries return only matching-label results
+#   - Nonexistent label returns empty
+#   - Non-label column filter does NOT break the index scan
+
+require vindex
+
+statement ok
+CREATE TABLE t(id INTEGER, vec FLOAT[8], cat BIGINT);
+
+statement ok
+INSERT INTO t SELECT i::INTEGER, [((i%3)*1000.0+i)::FLOAT, (i*0.1)::FLOAT, (i*0.01)::FLOAT, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8], (i%3)::BIGINT+1 FROM range(1, 301) t(i);
+
+statement ok
+CREATE INDEX idx ON t USING AISAQ(vec) WITH (quantizer='pq', m=4, bits=8, aisaq_r=16, aisaq_l=64, label_column='cat');
+
+# EQUALS filter: EXPLAIN shows VINDEX_INDEX_SCAN
+query II
+EXPLAIN SELECT id FROM t WHERE cat = 1 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5
+----
+physical_plan	<REGEX>:(?s).*TOP_N.*VINDEX_INDEX_SCAN.*
+
+# EQUALS: all results must have cat = 1
+query I
+SELECT count(*) FROM (SELECT id, cat FROM t WHERE cat = 1 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5) WHERE cat != 1
+----
+0
+
+# EQUALS on cat = 2: results count
+query I
+SELECT count(*) FROM (SELECT id FROM t WHERE cat = 2 ORDER BY array_distance(vec, [0,5,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5)
+----
+5
+
+# Nonexistent label: empty results
+query I
+SELECT count(*) FROM (SELECT id FROM t WHERE cat = 999 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5)
+----
+0
+
+# RANGE filter (cat > 1): EXPLAIN shows VINDEX_INDEX_SCAN
+query II
+EXPLAIN SELECT id FROM t WHERE cat > 1 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5
+----
+physical_plan	<REGEX>:(?s).*TOP_N.*VINDEX_INDEX_SCAN.*
+
+# RANGE: all results must have cat > 1
+query I
+SELECT count(*) FROM (SELECT id, cat FROM t WHERE cat > 1 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5) WHERE cat <= 1
+----
+0
+
+# RANGE: cat >= 2
+query I
+SELECT count(*) FROM (SELECT id, cat FROM t WHERE cat >= 2 ORDER BY array_distance(vec, [0,5,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5) WHERE cat < 2
+----
+0
+
+# RANGE: cat < 3
+query I
+SELECT count(*) FROM (SELECT id, cat FROM t WHERE cat < 3 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5) WHERE cat >= 3
+----
+0
+
+# RANGE: cat <= 2
+query I
+SELECT count(*) FROM (SELECT id, cat FROM t WHERE cat <= 2 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5) WHERE cat > 2
+----
+0
+
+# BETWEEN
+query I
+SELECT count(*) FROM (SELECT id, cat FROM t WHERE cat BETWEEN 1 AND 2 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5) WHERE cat < 1 OR cat > 2
+----
+0
+
+# Folded conjuncts: cat > 1 AND cat < 3
+query II
+EXPLAIN SELECT id FROM t WHERE cat > 1 AND cat < 3 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5
+----
+physical_plan	<REGEX>:(?s).*TOP_N.*VINDEX_INDEX_SCAN.*
+
+query I
+SELECT count(*) FROM (SELECT id, cat FROM t WHERE cat > 1 AND cat < 3 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5) WHERE cat <= 1 OR cat >= 3
+----
+0
+
+# No WHERE: index scan still works, returns results
+query I
+SELECT count(*) FROM (SELECT id, cat FROM t ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 10)
+----
+10
+
+# Non-label column filter: index scan still fires
+query II
+EXPLAIN SELECT id FROM t WHERE id > 50 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5
+----
+physical_plan	<REGEX>:(?s).*TOP_N.*VINDEX_INDEX_SCAN.*

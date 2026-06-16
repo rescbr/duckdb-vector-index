@@ -49,16 +49,28 @@ class CreateAiSaqIndexGlobalState final : public GlobalSinkState {
 	shared_ptr<ClientContext> context;
 
 	ColumnDataParallelScanState scan_state;
+	bool has_labels = false;
 
 	atomic<bool> is_building{false};
 	atomic<idx_t> loaded_count{0};
 	atomic<idx_t> built_count{0};
 };
 
+static bool OptionsHaveLabelColumn(const case_insensitive_map_t<Value> &options) {
+	auto it = options.find("label_column");
+	return it != options.end() && !it->second.IsNull() && !it->second.GetValue<string>().empty();
+}
+
 unique_ptr<GlobalSinkState> PhysicalCreateAiSaqIndex::GetGlobalSinkState(ClientContext &context) const {
 	auto gstate = make_uniq<CreateAiSaqIndexGlobalState>(*this);
 
-	vector<LogicalType> data_types = {unbound_expressions[0]->return_type, LogicalType::ROW_TYPE};
+	gstate->has_labels = OptionsHaveLabelColumn(info->options);
+
+	vector<LogicalType> data_types = {unbound_expressions[0]->return_type};
+	if (gstate->has_labels) {
+		data_types.push_back(LogicalType::BIGINT);
+	}
+	data_types.emplace_back(LogicalType::ROW_TYPE);
 	gstate->collection = make_uniq<ColumnDataCollection>(BufferManager::GetBufferManager(context), data_types);
 	gstate->context = context.shared_from_this();
 
@@ -81,7 +93,11 @@ class CreateAiSaqIndexLocalState final : public LocalSinkState {
 
 unique_ptr<LocalSinkState> PhysicalCreateAiSaqIndex::GetLocalSinkState(ExecutionContext &context) const {
 	auto state = make_uniq<CreateAiSaqIndexLocalState>();
-	vector<LogicalType> data_types = {unbound_expressions[0]->return_type, LogicalType::ROW_TYPE};
+	vector<LogicalType> data_types = {unbound_expressions[0]->return_type};
+	if (OptionsHaveLabelColumn(info->options)) {
+		data_types.push_back(LogicalType::BIGINT);
+	}
+	data_types.emplace_back(LogicalType::ROW_TYPE);
 	state->collection = make_uniq<ColumnDataCollection>(BufferManager::GetBufferManager(context.client), data_types);
 	state->collection->InitializeAppend(state->append_state);
 	return std::move(state);
@@ -133,14 +149,18 @@ class AiSaqIndexConstructTask final : public ExecutorTask {
 		build_chunk.Initialize(executor.context, {scan_chunk.data[0].GetType()});
 		Vector row_ids(LogicalType::ROW_TYPE);
 
+		const bool has_labels = gstate.has_labels;
+		const idx_t row_id_col = has_labels ? 2 : 1;
+
 		while (collection->Scan(scan_state, local_scan_state, scan_chunk)) {
 			const auto count = scan_chunk.size();
 			build_chunk.Reset();
 			build_chunk.data[0].Reference(scan_chunk.data[0]);
 			build_chunk.SetCardinality(count);
-			row_ids.Reference(scan_chunk.data[1]);
+			row_ids.Reference(scan_chunk.data[row_id_col]);
 
-			gstate.global_index->Construct(build_chunk, row_ids, thread_id);
+			Vector *labels = has_labels ? &scan_chunk.data[1] : nullptr;
+			gstate.global_index->Construct(build_chunk, row_ids, thread_id, labels);
 			gstate.built_count += count;
 
 			if (mode == TaskExecutionMode::PROCESS_PARTIAL) {
@@ -192,6 +212,7 @@ class AiSaqIndexConstructionEvent final : public BasePipelineEvent {
 	void FinishEvent() override {
 		gstate.global_index->FinalizeInlineCodes();
 		gstate.global_index->ComputeEntryPoints();
+		gstate.global_index->ComputeLabelMedoids();
 		gstate.global_index->SetDirty();
 		gstate.global_index->SyncSize();
 

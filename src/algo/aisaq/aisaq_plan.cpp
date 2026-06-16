@@ -1,6 +1,8 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/column_index.hpp"
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parser/parsed_data/create_index_info.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
@@ -115,11 +117,52 @@ PhysicalOperator &AiSaqIndex::CreatePlan(PlanIndexInput &input) {
 		throw BinderException("AiSAQ index key type must be 'FLOAT[N]'");
 	}
 
+	// Resolve label_column (if any) to a scan column index.
+	idx_t label_scan_idx = DConstants::INVALID_INDEX;
+	for (const auto &opt : create_index.info->options) {
+		if (StringUtil::CIEquals(opt.first, "label_column") && !opt.second.IsNull()) {
+			const auto label_name = opt.second.GetValue<string>();
+			if (!label_name.empty()) {
+				for (const auto &col : create_index.table.GetColumns().Logical()) {
+					if (StringUtil::CIEquals(col.GetName(), label_name)) {
+						label_scan_idx = col.Oid();
+						if (col.Type() != LogicalType::BIGINT) {
+							throw BinderException("AiSAQ label_column '%s' must be BIGINT (got %s)", label_name,
+							                      col.Type().ToString());
+						}
+						break;
+					}
+				}
+				if (label_scan_idx == DConstants::INVALID_INDEX) {
+					throw BinderException("AiSAQ label_column '%s' not found in table", label_name);
+				}
+			}
+			break;
+		}
+	}
+
+	// When label_column is set, inject it into the physical table scan so the
+	// projection can reference it. The scan currently outputs [vec, rowid];
+	// we insert the label column before rowid → [vec, label, rowid].
+	idx_t label_scan_pos = DConstants::INVALID_INDEX;
+	if (label_scan_idx != DConstants::INVALID_INDEX) {
+		auto &scan = input.table_scan.Cast<PhysicalTableScan>();
+		label_scan_pos = scan.column_ids.size() - 1; // position before rowid
+		scan.column_ids.insert(scan.column_ids.begin() + label_scan_pos, ColumnIndex(label_scan_idx));
+		scan.types.insert(scan.types.begin() + label_scan_pos, LogicalType::BIGINT);
+		// Keep scan_types in sync so the rowid BoundReferenceExpression resolves.
+		create_index.info->scan_types.insert(create_index.info->scan_types.end() - 1, LogicalType::BIGINT);
+	}
+
 	vector<LogicalType> new_column_types;
 	vector<unique_ptr<Expression>> select_list;
 	for (auto &expression : create_index.expressions) {
 		new_column_types.push_back(expression->return_type);
 		select_list.push_back(std::move(expression));
+	}
+	if (label_scan_pos != DConstants::INVALID_INDEX) {
+		new_column_types.push_back(LogicalType::BIGINT);
+		select_list.push_back(make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, label_scan_pos));
 	}
 	new_column_types.emplace_back(LogicalType::ROW_TYPE);
 	select_list.push_back(

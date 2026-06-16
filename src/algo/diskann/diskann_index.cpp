@@ -351,7 +351,8 @@ static idx_t ResolveLSearch(ClientContext &context, idx_t fallback) {
 	return fallback;
 }
 
-unique_ptr<IndexScanState> DiskAnnIndex::InitializeScan(float *query_vector, idx_t limit, ClientContext &context) {
+unique_ptr<IndexScanState> DiskAnnIndex::InitializeScan(float *query_vector, idx_t limit, ClientContext &context,
+                                                         const LabelFilter & /*label_filter*/) {
 	auto state = make_uniq<DiskAnnIndexScanState>();
 	const idx_t L_search = ResolveLSearch(context, params_.L);
 

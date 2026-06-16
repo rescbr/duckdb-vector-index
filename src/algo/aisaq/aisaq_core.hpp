@@ -1,10 +1,12 @@
 #pragma once
 
 #include "duckdb/common/typedefs.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/storage/buffer/buffer_handle.hpp"
 
 #include "algo/aisaq/aisaq_block_store.hpp"
+#include "vindex/label_filter.hpp"
 #include "vindex/quantizer.hpp"
 #include "vindex/unaligned.hpp"
 
@@ -54,13 +56,30 @@ class AiSaqCore {
 
 	// Vamana online insert. The PQ code for this internal_id must already be
 	// present in the block store (written by the PQ encoding pass). Returns
-	// the allocated internal_id.
-	uint32_t Insert(int64_t row_id, const float *vec);
+	// the allocated internal_id. label = INT64_MIN means "no label".
+	uint32_t Insert(int64_t row_id, const float *vec, int64_t label = INT64_MIN);
 
 	// Paged-PQ approximate kNN. `query_lut` is a pre-populated LUT
 	// (Quantizer::PopulateDistanceLUT). L_search overrides params_.L when > 0.
 	// beam_width / io_limit bound the I/O fan-out; io_limit == 0 means unbounded.
-	vector<Candidate> Search(const float *query_lut, idx_t k, idx_t L_search, idx_t beam_width, idx_t io_limit) const;
+	//
+	// When label_filter is active:
+	//   EQUALS(value):
+	//     Entry point = label_medoids_[value] (single targeted start).
+	//     Candidates with label != value are skipped during graph expansion.
+	//
+	//   RANGE(lo, hi):
+	//     Count matching labels N = |{l : lo <= l <= hi}|.
+	//     If N <= params_.n_entry_points:
+	//       Entry points = {label_medoids_[l] for all matching l}.
+	//     Else:
+	//       Entry points = global k-means entry points (ComputeEntryPoints).
+	//     Candidates with label outside [lo, hi] are skipped during expansion.
+	//
+	//   NONE:
+	//     Global entry points; no candidate filtering.
+	vector<Candidate> Search(const float *query_lut, idx_t k, idx_t L_search, idx_t beam_width, idx_t io_limit,
+	                         const LabelFilter &label_filter = LabelFilter::None()) const;
 
 	// Copy the PQ codes of the first `inline_pq_count` neighbors into each
 	// node's inline region. No-op when inline_pq_count == 0.
@@ -69,6 +88,24 @@ class AiSaqCore {
 	// Populate entry_points_ with up to n_entry_points spread-out nodes whose
 	// PQ codes are cached inline for the entry-point distance probe at search.
 	void ComputeEntryPoints();
+
+	// Compute per-label medoids after all inserts. For each label, finds the
+	// member whose PQ code is closest to the label's centroid (approximated
+	// by averaging PQ codes). Also builds sorted_labels_ for range queries.
+	void ComputeLabelMedoids();
+
+	// Count labels in [lo, hi] via binary search on sorted_labels_.
+	idx_t CountLabelsInRange(int64_t lo, int64_t hi) const;
+
+	// Collect medoids for labels in [lo, hi], up to max_count.
+	// Returns empty if the count exceeds max_count (caller should fall back
+	// to global entry points).
+	vector<uint32_t> GetMedoidsInRange(int64_t lo, int64_t hi, idx_t max_count) const;
+
+	// Whether any labels have been registered.
+	bool HasLabels() const {
+		return !label_to_internal_ids_.empty();
+	}
 
 	idx_t Size() const {
 		return size_;
@@ -164,7 +201,13 @@ class AiSaqCore {
 	// Vamana greedy beam search. Returns up to `L` nearest candidates
 	// (ascending distance). Candidates carry internal_id in the row_id field;
 	// the caller resolves to table row_id via PinNode + GetRowId.
-	vector<Candidate> BeamSearch(const float *query_lut, idx_t L, idx_t io_limit) const;
+	//
+	// forced_entry_points: when non-null and non-empty, use these as start
+	// points instead of PickEntryPoint (for label-mediated multi-start).
+	// label_filter: when non-null, skip neighbors whose label doesn't match.
+	vector<Candidate> BeamSearch(const float *query_lut, idx_t L, idx_t io_limit,
+	                             const vector<uint32_t> *forced_entry_points = nullptr,
+	                             const LabelFilter *label_filter = nullptr) const;
 
 	vector<Candidate> RobustPrune(const float *query_lut, vector<Candidate> candidates, idx_t R, float alpha) const;
 
@@ -184,6 +227,16 @@ class AiSaqCore {
 	uint32_t entry_internal_ = 0; // build-time entry (= first inserted node)
 
 	uint32_t size_ = 0;
+
+	// Label bookkeeping (populated when labels are provided at insert time).
+	// internal_id → label (for candidate filtering during search).
+	unordered_map<uint32_t, int64_t> internal_id_to_label_;
+	// label → list of internal_ids belonging to that label.
+	unordered_map<int64_t, vector<uint32_t>> label_to_internal_ids_;
+	// label → medoid internal_id (node closest to the label's centroid).
+	unordered_map<int64_t, uint32_t> label_medoids_;
+	// Sorted label keys for efficient range queries (lower_bound/upper_bound).
+	vector<int64_t> sorted_labels_;
 
 	mutable vector<uint32_t> visit_marks_;
 	mutable uint32_t visit_counter_ = 0;

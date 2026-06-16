@@ -64,7 +64,7 @@ static unique_ptr<GlobalTableFunctionState> VectorIndexScanInitGlobal(ClientCont
 	if (!vi) {
 		throw InternalException("vindex_index_scan invoked on a non-VectorIndex");
 	}
-	result->index_state = vi->InitializeScan(bind_data.query.get(), bind_data.limit, context);
+	result->index_state = vi->InitializeScan(bind_data.query.get(), bind_data.limit, context, bind_data.label_filter);
 
 	if (!input.CanRemoveFilterColumns()) {
 		return std::move(result);

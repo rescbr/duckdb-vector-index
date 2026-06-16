@@ -3,11 +3,6 @@
 #
 # Checkpoint + restart round-trip. Persistence is experimental — gated on
 # vindex_enable_experimental_persistence = true.
-#
-# The post-restart section is skipped due to an upstream DuckDB issue:
-# IndexCatalogEntry::GetInfo() drops WITH options on restart, so the
-# deserialized index doesn't know its quantizer type. Tracked in
-# duckdb issue #22317. Remove the mode skip/unskip when fixed.
 
 require vindex
 
@@ -38,9 +33,6 @@ SELECT count(*) FROM (SELECT id FROM t ORDER BY array_distance(vec, [10,11,12,13
 statement ok
 CHECKPOINT;
 
-# Upstream bug: WITH options lost on restart (duckdb #22317).
-mode skip
-
 restart
 
 statement ok
@@ -60,5 +52,3 @@ query I
 SELECT count FROM pragma_vindex_aisaq_index_info() WHERE index_name = 'my_idx'
 ----
 500
-
-mode unskip

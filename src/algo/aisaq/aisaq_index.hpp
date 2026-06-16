@@ -158,6 +158,7 @@ class AiSaqIndex : public VectorIndex {
 	unordered_set<row_t> tombstones_;
 
 	bool is_dirty = false;
+	case_insensitive_map_t<Value> stored_options_;
 	StorageLock rwlock;
 	atomic<idx_t> index_size = {0};
 

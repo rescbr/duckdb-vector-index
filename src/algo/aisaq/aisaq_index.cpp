@@ -225,6 +225,7 @@ AiSaqIndex::AiSaqIndex(const string &name, IndexConstraintType index_constraint_
 	auto &buffer_manager = block_manager.GetBufferManager();
 	block_store_ = make_uniq<AiSaqBlockStore>(block_manager, buffer_manager);
 	state_store_ = make_uniq<IndexBlockStore>(block_manager);
+	stored_options_ = options;
 
 	D_ASSERT(logical_types.size() == 1);
 	auto &vector_type = logical_types[0];
@@ -693,14 +694,16 @@ IndexStorageInfo AiSaqIndex::SerializeToDisk(QueryContext context, const case_in
 	IndexStorageInfo info = state_store_->GetInfo();
 	info.name = name;
 	info.root = state_root_.Get();
+	info.options = stored_options_;
 	return info;
 }
 
-IndexStorageInfo AiSaqIndex::SerializeToWAL(const case_insensitive_map_t<Value> &options) {
+IndexStorageInfo AiSaqIndex::SerializeToWAL(const case_insensitive_map_t<Value> & /*options*/) {
 	PersistToDisk();
 	IndexStorageInfo info = state_store_->GetInfo();
 	info.name = name;
 	info.root = state_root_.Get();
+	info.options = stored_options_;
 	info.buffers = state_store_->InitSerializationToWAL();
 	return info;
 }
@@ -737,8 +740,12 @@ void RegisterIndex(DatabaseInstance &db) {
 	IndexType index_type;
 	index_type.name = AiSaqIndex::TYPE_NAME;
 	index_type.create_instance = [](CreateIndexInput &input) -> unique_ptr<BoundIndex> {
+		// DuckDB v1.5.x: IndexCatalogEntry::GetInfo() does not copy the options
+		// map, so on checkpoint restart input.options is empty. Fall back to
+		// storage_info.options (populated in SerializeToDisk/SerializeToWAL).
+		const auto &opts = input.options.empty() ? input.storage_info.options : input.options;
 		auto res = make_uniq<AiSaqIndex>(input.name, input.constraint_type, input.column_ids, input.table_io_manager,
-		                                 input.unbound_expressions, input.db, input.options, input.storage_info);
+		                                 input.unbound_expressions, input.db, opts, input.storage_info);
 		return std::move(res);
 	};
 	index_type.create_plan = AiSaqIndex::CreatePlan;

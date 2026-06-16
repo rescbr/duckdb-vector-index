@@ -23,6 +23,7 @@ add_executable(vindex_unit
     test_scann_quantizer.cpp
     test_diskann_core.cpp
     test_spann_core.cpp
+    test_aisaq_core.cpp
     ${PROJECT_SOURCE_DIR}/src/common/metric.cpp
     ${PROJECT_SOURCE_DIR}/src/common/index_block_store.cpp
     ${PROJECT_SOURCE_DIR}/src/algo/hnsw/hnsw_core.cpp
@@ -30,6 +31,8 @@ add_executable(vindex_unit
     ${PROJECT_SOURCE_DIR}/src/algo/ivf/ivf_core.cpp
     ${PROJECT_SOURCE_DIR}/src/algo/diskann/diskann_core.cpp
     ${PROJECT_SOURCE_DIR}/src/algo/spann/spann_core.cpp
+    ${PROJECT_SOURCE_DIR}/src/algo/aisaq/aisaq_block_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/algo/aisaq/aisaq_core.cpp
     ${PROJECT_SOURCE_DIR}/src/quant/flat/flat_quantizer.cpp
     ${PROJECT_SOURCE_DIR}/src/quant/pq/pq_quantizer.cpp
     ${PROJECT_SOURCE_DIR}/src/quant/scann/scann_quantizer.cpp

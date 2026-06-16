@@ -12,6 +12,7 @@
 
 // Forward declarations of per-algorithm registration entrypoints. Each
 // algorithm's module.hpp exposes a `Register(ExtensionLoader&)` symbol.
+#include "algo/aisaq/aisaq_module.hpp"
 #include "algo/diskann/diskann_module.hpp"
 #include "algo/hnsw/hnsw_module.hpp"
 #include "algo/ivf/ivf_module.hpp"
@@ -55,6 +56,7 @@ void RegisterBuiltInAlgorithms(ExtensionLoader &loader) {
 	ivf::Register(loader);
 	diskann::Register(loader);
 	spann::Register(loader);
+	aisaq::Register(loader);
 	RegisterCompactPragma(loader);
 
 	// 2) Shared optimizers — registered once, dispatch via VectorIndexRegistry.

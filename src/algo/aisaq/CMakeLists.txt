@@ -1,0 +1,10 @@
+set(EXTENSION_SOURCES
+    ${EXTENSION_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/aisaq_register.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/aisaq_block_store.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/aisaq_core.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/aisaq_index.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/aisaq_build.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/aisaq_plan.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/aisaq_pragmas.cpp
+    PARENT_SCOPE)

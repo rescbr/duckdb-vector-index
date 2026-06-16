@@ -390,6 +390,29 @@ void ScannQuantizer::Deserialize(const_data_ptr_t in, idx_t size) {
 	trained_ = true;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3: LUT virtuals
+// ---------------------------------------------------------------------------
+
+void ScannQuantizer::PopulateDistanceLUT(const float *query_preproc, float *lut_out) const {
+	const idx_t size = LUTSize();
+	std::memcpy(lut_out, query_preproc, size * sizeof(float));
+}
+
+float ScannQuantizer::LUTDistance(const_data_ptr_t code, const float *lut) const {
+	const idx_t k = CentroidsPerSlot();
+	float acc = 0.0f;
+	for (idx_t s = 0; s < idx_t(m_); s++) {
+		const uint32_t cid = ReadCode(code, s);
+		acc += lut[s * k + cid];
+	}
+	return acc;
+}
+
+idx_t ScannQuantizer::LUTSize() const {
+	return idx_t(m_) * CentroidsPerSlot();
+}
+
 } // namespace scann
 } // namespace vindex
 } // namespace duckdb

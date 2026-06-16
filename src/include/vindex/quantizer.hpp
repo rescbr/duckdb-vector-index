@@ -8,6 +8,8 @@
 
 #include "vindex/metric.hpp"
 
+#include <limits>
+
 namespace duckdb {
 namespace vindex {
 
@@ -66,6 +68,36 @@ public:
 	virtual idx_t QueryWorkspaceSize() const = 0; // floats
 	virtual MetricKind Metric() const = 0;
 	virtual QuantizerKind Kind() const = 0;
+
+	// --- LUT-based distance (Phase 3) ---------------------------------------
+	// Populate a look-up table of per-chunk distances from the (already
+	// preprocessed) query to all PQ centroids. The LUT has layout:
+	//   lut[s * CentroidsPerSlot() + c]
+	// for s in [0, m) and c in [0, CentroidsPerSlot()).
+	//
+	// Default: no-op (signals LUT path unavailable). PqQuantizer and
+	// ScannQuantizer override with the actual computation.
+	virtual void PopulateDistanceLUT(const float *query_preproc, float *lut_out) const {
+		(void)query_preproc;
+		(void)lut_out;
+	}
+
+	// Estimated distance from a code to a query using a pre-populated LUT.
+	// Must produce the same value as EstimateDistance(code, query_preproc).
+	//
+	// Default: returns NaN (signals unavailable). Callers must check
+	// LUTSize() > 0 before using the LUT path.
+	virtual float LUTDistance(const_data_ptr_t code, const float *lut) const {
+		(void)code;
+		(void)lut;
+		return std::numeric_limits<float>::quiet_NaN();
+	}
+
+	// Size of the LUT in floats (= m * CentroidsPerSlot() for PQ/ScaNN).
+	// Default: 0 (LUT path unavailable).
+	virtual idx_t LUTSize() const {
+		return 0;
+	}
 
 	// Serialize learned parameters (rotation matrix, PQ centroids, ...) to a
 	// self-describing blob. The blob is appended to the index's block store

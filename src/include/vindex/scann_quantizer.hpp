@@ -64,6 +64,11 @@ public:
 	void Serialize(vector<data_t> &out) const override;
 	void Deserialize(const_data_ptr_t in, idx_t size) override;
 
+	// Phase 3: LUT virtuals.
+	void PopulateDistanceLUT(const float *query_preproc, float *lut_out) const override;
+	float LUTDistance(const_data_ptr_t code, const float *lut) const override;
+	idx_t LUTSize() const override;
+
 	// Introspection for tests / pragmas.
 	uint8_t M() const {
 		return m_;

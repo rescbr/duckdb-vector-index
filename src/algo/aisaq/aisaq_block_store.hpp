@@ -2,9 +2,10 @@
 
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/storage/block_manager.hpp"
-#include "duckdb/storage/buffer/buffer_handle.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
+#include "duckdb/storage/buffer/buffer_handle.hpp"
 #include "duckdb/storage/storage_info.hpp"
 
 namespace duckdb {
@@ -83,6 +84,12 @@ class AiSaqBlockStore {
 	}
 
 	// --- Persistence ---
+
+	// Convert all transient blocks to persistent DuckDB blocks.
+	// Called at checkpoint (SerializeToDisk). After this call, all
+	// block IDs in graph_block_ids_ and pq_page_block_ids_ are valid
+	// persistent block IDs.
+	void ConvertToPersistent(QueryContext context);
 
 	void SerializeState(vector<data_t> &out) const;
 	void DeserializeState(const_data_ptr_t in, idx_t size);

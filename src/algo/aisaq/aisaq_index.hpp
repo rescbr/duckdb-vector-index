@@ -14,6 +14,7 @@
 
 #include "algo/aisaq/aisaq_block_store.hpp"
 #include "algo/aisaq/aisaq_core.hpp"
+#include "vindex/index_block_store.hpp"
 #include "vindex/quantizer.hpp"
 #include "vindex/vector_index.hpp"
 
@@ -129,8 +130,11 @@ class AiSaqIndex : public VectorIndex {
 
   private:
 	unique_ptr<AiSaqBlockStore> block_store_;
+	unique_ptr<IndexBlockStore> state_store_; // for state stream (LinkedBlock chain)
 	unique_ptr<Quantizer> quantizer_;
 	unique_ptr<AiSaqCore> core_;
+
+	BlockId state_root_;
 
 	MetricKind metric_{MetricKind::L2SQ};
 	idx_t dim_ = 0;
@@ -148,6 +152,10 @@ class AiSaqIndex : public VectorIndex {
 	atomic<idx_t> index_size = {0};
 
 	void InitFromOptions(const case_insensitive_map_t<Value> &options, idx_t vector_size, MetricKind metric);
+
+	void WriteStateStream();
+	void ReadStateStream(BlockId root);
+	void PersistToDisk();
 };
 
 } // namespace aisaq

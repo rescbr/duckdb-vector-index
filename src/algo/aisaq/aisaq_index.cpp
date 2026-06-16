@@ -17,6 +17,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/storage/storage_info.hpp"
+#include "duckdb/storage/partial_block_manager.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
 
 #include "algo/aisaq/aisaq_module.hpp"
@@ -223,6 +224,7 @@ AiSaqIndex::AiSaqIndex(const string &name, IndexConstraintType index_constraint_
 	auto &block_manager = table_io_manager.GetIndexBlockManager();
 	auto &buffer_manager = block_manager.GetBufferManager();
 	block_store_ = make_uniq<AiSaqBlockStore>(block_manager, buffer_manager);
+	state_store_ = make_uniq<IndexBlockStore>(block_manager);
 
 	D_ASSERT(logical_types.size() == 1);
 	auto &vector_type = logical_types[0];
@@ -237,7 +239,13 @@ AiSaqIndex::AiSaqIndex(const string &name, IndexConstraintType index_constraint_
 	InitFromOptions(options, vector_size, metric);
 
 	auto lock = rwlock.GetExclusiveLock();
-	(void)info; // persistence is experimental — see SerializeToDisk.
+	if (info.IsValid()) {
+		state_root_.Set(info.root);
+		state_store_->Init(info);
+		if (state_root_.Get() != 0) {
+			ReadStateStream(state_root_);
+		}
+	}
 	index_size = core_->Size();
 	(void)estimated_cardinality;
 }
@@ -530,12 +538,164 @@ ErrorData AiSaqIndex::Append(IndexLock &lock, DataChunk &appended_data, Vector &
 // Persistence (experimental)
 //------------------------------------------------------------------------------
 
+static constexpr uint64_t kAiSaqStateMagic = 0x3153414944415153ULL; // "SAQIDAIS1"
+
+void AiSaqIndex::WriteStateStream() {
+	if (state_root_.Get() == 0) {
+		state_root_ = BlockId {};
+	}
+	auto writer = state_store_->BeginStream(state_root_);
+	state_root_ = writer->Root();
+
+	const uint64_t magic = kAiSaqStateMagic;
+	writer->Write(reinterpret_cast<const_data_ptr_t>(&magic), sizeof(magic));
+
+	const uint64_t rerank = uint64_t(rerank_multiple_);
+	writer->Write(reinterpret_cast<const_data_ptr_t>(&rerank), sizeof(rerank));
+
+	// Quantizer blob
+	vector<data_t> qblob;
+	quantizer_->Serialize(qblob);
+	const uint32_t qsize = uint32_t(qblob.size());
+	writer->Write(reinterpret_cast<const_data_ptr_t>(&qsize), sizeof(qsize));
+	if (qsize > 0) {
+		writer->Write(qblob.data(), qsize);
+	}
+
+	// Block store state (node_size, code_size, block IDs)
+	vector<data_t> bs_blob;
+	block_store_->SerializeState(bs_blob);
+	const uint32_t bs_size = uint32_t(bs_blob.size());
+	writer->Write(reinterpret_cast<const_data_ptr_t>(&bs_size), sizeof(bs_size));
+	if (bs_size > 0) {
+		writer->Write(bs_blob.data(), bs_size);
+	}
+
+	// Core state (entry points, params, size)
+	vector<data_t> cblob;
+	core_->SerializeState(cblob);
+	const uint32_t csize = uint32_t(cblob.size());
+	writer->Write(reinterpret_cast<const_data_ptr_t>(&csize), sizeof(csize));
+	if (csize > 0) {
+		writer->Write(cblob.data(), csize);
+	}
+
+	// row_to_internal map
+	const uint64_t rsize = row_to_internal_.size();
+	writer->Write(reinterpret_cast<const_data_ptr_t>(&rsize), sizeof(rsize));
+	for (const auto &kv : row_to_internal_) {
+		const int64_t rid = kv.first;
+		const uint32_t iid = kv.second;
+		writer->Write(reinterpret_cast<const_data_ptr_t>(&rid), sizeof(rid));
+		writer->Write(reinterpret_cast<const_data_ptr_t>(&iid), sizeof(iid));
+	}
+
+	// tombstones
+	const uint64_t tsize = tombstones_.size();
+	writer->Write(reinterpret_cast<const_data_ptr_t>(&tsize), sizeof(tsize));
+	for (const auto &t : tombstones_) {
+		const int64_t rid = t;
+		writer->Write(reinterpret_cast<const_data_ptr_t>(&rid), sizeof(rid));
+	}
+}
+
+void AiSaqIndex::ReadStateStream(BlockId root) {
+	auto reader = state_store_->OpenStream(root);
+
+	uint64_t magic = 0;
+	reader->Read(reinterpret_cast<data_ptr_t>(&magic), sizeof(magic));
+	if (magic != kAiSaqStateMagic) {
+		throw InternalException("AiSaqIndex: unrecognized state stream (magic mismatch)");
+	}
+
+	uint64_t rerank = 1;
+	reader->Read(reinterpret_cast<data_ptr_t>(&rerank), sizeof(rerank));
+	rerank_multiple_ = idx_t(rerank == 0 ? 1 : rerank);
+
+	uint32_t qsize = 0;
+	reader->Read(reinterpret_cast<data_ptr_t>(&qsize), sizeof(qsize));
+	if (qsize > 0) {
+		vector<data_t> qblob(qsize);
+		reader->Read(qblob.data(), qsize);
+		quantizer_->Deserialize(qblob.data(), qsize);
+	}
+
+	uint32_t bs_size = 0;
+	reader->Read(reinterpret_cast<data_ptr_t>(&bs_size), sizeof(bs_size));
+	if (bs_size > 0) {
+		vector<data_t> bs_blob(bs_size);
+		reader->Read(bs_blob.data(), bs_size);
+		block_store_->DeserializeState(bs_blob.data(), bs_size);
+	}
+
+	uint32_t csize = 0;
+	reader->Read(reinterpret_cast<data_ptr_t>(&csize), sizeof(csize));
+	if (csize > 0) {
+		vector<data_t> cblob(csize);
+		reader->Read(cblob.data(), csize);
+		core_->DeserializeState(cblob.data(), csize);
+	}
+
+	uint64_t rsize = 0;
+	reader->Read(reinterpret_cast<data_ptr_t>(&rsize), sizeof(rsize));
+	row_to_internal_.clear();
+	row_to_internal_.reserve(rsize);
+	for (uint64_t i = 0; i < rsize; i++) {
+		int64_t rid = 0;
+		uint32_t iid = 0;
+		reader->Read(reinterpret_cast<data_ptr_t>(&rid), sizeof(rid));
+		reader->Read(reinterpret_cast<data_ptr_t>(&iid), sizeof(iid));
+		row_to_internal_.emplace(row_t(rid), iid);
+	}
+
+	uint64_t tsize = 0;
+	reader->Read(reinterpret_cast<data_ptr_t>(&tsize), sizeof(tsize));
+	tombstones_.clear();
+	tombstones_.reserve(tsize);
+	for (uint64_t i = 0; i < tsize; i++) {
+		int64_t rid = 0;
+		reader->Read(reinterpret_cast<data_ptr_t>(&rid), sizeof(rid));
+		tombstones_.insert(row_t(rid));
+	}
+}
+
+void AiSaqIndex::PersistToDisk() {
+	auto lock = rwlock.GetExclusiveLock();
+	if (!is_dirty) {
+		return;
+	}
+	WriteStateStream();
+	is_dirty = false;
+}
+
 IndexStorageInfo AiSaqIndex::SerializeToDisk(QueryContext context, const case_insensitive_map_t<Value> &options) {
-	throw NotImplementedException("AiSAQ persistence is not yet implemented (experimental)");
+	PersistToDisk();
+
+	// Convert transient blocks to persistent DuckDB blocks.
+	block_store_->ConvertToPersistent(context);
+
+	// Re-write state stream now that block IDs are persistent.
+	WriteStateStream();
+
+	// Serialize the state store's LinkedBlock chain to metadata blocks.
+	auto &block_manager = table_io_manager.GetIndexBlockManager();
+	PartialBlockManager partial_block_manager(context, block_manager, PartialBlockType::FULL_CHECKPOINT);
+	state_store_->SerializeBuffers(partial_block_manager);
+	partial_block_manager.FlushPartialBlocks();
+
+	IndexStorageInfo info = state_store_->GetInfo();
+	info.name = name;
+	info.root = state_root_.Get();
+	return info;
 }
 
 IndexStorageInfo AiSaqIndex::SerializeToWAL(const case_insensitive_map_t<Value> &options) {
-	throw NotImplementedException("AiSAQ persistence is not yet implemented (experimental)");
+	PersistToDisk();
+	IndexStorageInfo info = state_store_->GetInfo();
+	info.name = name;
+	info.root = state_root_.Get();
+	info.buffers = state_store_->InitSerializationToWAL();
+	return info;
 }
 
 idx_t AiSaqIndex::GetInMemorySize(IndexLock &state) {

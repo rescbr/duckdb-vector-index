@@ -113,6 +113,31 @@ template <typename T> T ConsumePacked(const_data_ptr_t &cur, const_data_ptr_t en
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// Persistence — convert transient blocks to persistent
+// ---------------------------------------------------------------------------
+
+void AiSaqBlockStore::ConvertToPersistent(QueryContext context) {
+	for (idx_t i = 0; i < graph_block_handles_.size(); i++) {
+		if (graph_block_ids_[i] != INVALID_BLOCK) {
+			continue;
+		}
+		auto bid = block_manager_.GetFreeBlockId();
+		auto new_handle = block_manager_.ConvertToPersistent(context, bid, graph_block_handles_[i]);
+		graph_block_handles_[i] = new_handle;
+		graph_block_ids_[i] = bid;
+	}
+	for (idx_t i = 0; i < pq_page_handles_.size(); i++) {
+		if (pq_page_block_ids_[i] != INVALID_BLOCK) {
+			continue;
+		}
+		auto bid = block_manager_.GetFreeBlockId();
+		auto new_handle = block_manager_.ConvertToPersistent(context, bid, pq_page_handles_[i]);
+		pq_page_handles_[i] = new_handle;
+		pq_page_block_ids_[i] = bid;
+	}
+}
+
 void AiSaqBlockStore::SerializeState(vector<data_t> &out) const {
 	AppendPacked<uint64_t>(out, static_cast<uint64_t>(node_size_));
 	AppendPacked<uint64_t>(out, static_cast<uint64_t>(graph_node_count_));

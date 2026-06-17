@@ -79,7 +79,7 @@ vector<DiskAnnCore::Candidate> DiskAnnCore::BeamSearch(const float *query_prepro
 
 	const uint32_t entry_internal = ([&]() {
 		data_ptr_t e = store_.PinFast(entry_);
-		return NodeInternalId(e);
+		return GetNodeInternalId(e);
 	})();
 	const float entry_dist = DistanceToCode(query_preproc, entry_internal);
 	if (entry_internal >= visit_marks_.size()) {
@@ -99,12 +99,11 @@ vector<DiskAnnCore::Candidate> DiskAnnCore::BeamSearch(const float *query_prepro
 		// a buffer DuckDB has evicted; PinFast brings it back in.
 		BlockId nid = node_blocks_[best.internal_id];
 		data_ptr_t node = store_.PinFast(nid);
-		const uint16_t n = NeighborCount(node);
-		const BlockId *neigh = NeighborArray(node);
+		const uint16_t n = GetNeighborCount(node);
 		for (uint16_t i = 0; i < n; i++) {
-			BlockId nb_block = neigh[i];
+			BlockId nb_block = GetNeighborAt(node, i);
 			data_ptr_t nb_node = store_.PinFast(nb_block);
-			const uint32_t nb_internal = NodeInternalId(nb_node);
+			const uint32_t nb_internal = GetNodeInternalId(nb_node);
 			if (nb_internal >= visit_marks_.size()) {
 				visit_marks_.resize(std::max<size_t>(visit_marks_.size() * 2, size_t(nb_internal) + 1), 0);
 			}
@@ -181,11 +180,10 @@ void DiskAnnCore::ConnectAndPrune(BlockId new_id, uint32_t new_internal_id, cons
 	// Write the forward edges on the new node.
 	{
 		data_ptr_t n = store_.PinFast(new_id);
-		uint16_t &cnt = NeighborCount(n);
-		BlockId *arr = NeighborArray(n);
-		cnt = uint16_t(std::min<idx_t>(selected.size(), params_.R));
+		const uint16_t cnt = uint16_t(std::min<idx_t>(selected.size(), params_.R));
+		SetNeighborCount(n, cnt);
 		for (idx_t i = 0; i < cnt; i++) {
-			arr[i] = node_blocks_[uint32_t(selected[i].row_id)];
+			SetNeighborAt(n, i, node_blocks_[uint32_t(selected[i].row_id)]);
 		}
 	}
 
@@ -195,10 +193,10 @@ void DiskAnnCore::ConnectAndPrune(BlockId new_id, uint32_t new_internal_id, cons
 		const uint32_t s_internal = uint32_t(s.row_id);
 		BlockId sid = node_blocks_[s_internal];
 		data_ptr_t sn = store_.PinFast(sid);
-		uint16_t &cnt = NeighborCount(sn);
-		BlockId *arr = NeighborArray(sn);
+		uint16_t cnt = GetNeighborCount(sn);
 		if (cnt < params_.R) {
-			arr[cnt++] = new_id;
+			SetNeighborAt(sn, cnt, new_id);
+			SetNeighborCount(sn, uint16_t(cnt + 1));
 			continue;
 		}
 		// Collect s's current neighbors + new_node, rank by d(s, ·) via
@@ -207,19 +205,17 @@ void DiskAnnCore::ConnectAndPrune(BlockId new_id, uint32_t new_internal_id, cons
 		cand.reserve(cnt + 1);
 		cand.push_back({int64_t(new_internal_id), CodeDistance(s_internal, new_internal_id)});
 		for (uint16_t i = 0; i < cnt; i++) {
-			BlockId nb = arr[i];
+			BlockId nb = GetNeighborAt(sn, i);
 			data_ptr_t nb_node = store_.PinFast(nb);
-			const uint32_t nb_internal = NodeInternalId(nb_node);
+			const uint32_t nb_internal = GetNodeInternalId(nb_node);
 			cand.push_back({int64_t(nb_internal), CodeDistance(s_internal, nb_internal)});
 		}
 		auto kept = RobustPrune(new_preproc, std::move(cand), params_.R, params_.alpha);
 
 		data_ptr_t sn2 = store_.PinFast(sid);
-		uint16_t &cnt2 = NeighborCount(sn2);
-		BlockId *arr2 = NeighborArray(sn2);
-		cnt2 = uint16_t(kept.size());
+		SetNeighborCount(sn2, uint16_t(kept.size()));
 		for (idx_t i = 0; i < kept.size(); i++) {
-			arr2[i] = node_blocks_[uint32_t(kept[i].row_id)];
+			SetNeighborAt(sn2, i, node_blocks_[uint32_t(kept[i].row_id)]);
 		}
 	}
 }
@@ -240,9 +236,9 @@ BlockId DiskAnnCore::Insert(int64_t row_id, const float *vec) {
 	{
 		data_ptr_t n = store_.PinFast(new_id);
 		std::memset(n, 0, kHeaderBytes + idx_t(params_.R) * sizeof(BlockId));
-		NodeRowId(n) = row_id;
-		NodeInternalId(n) = internal_id;
-		NeighborCount(n) = 0;
+		SetNodeRowId(n, row_id);
+		SetNodeInternalId(n, internal_id);
+		SetNeighborCount(n, 0);
 	}
 	node_blocks_.push_back(new_id);
 	if (internal_id >= visit_marks_.size()) {
@@ -291,7 +287,7 @@ vector<DiskAnnCore::Candidate> DiskAnnCore::Search(const float *query_preproc, i
 	for (auto &c : cands) {
 		BlockId nid = node_blocks_[uint32_t(c.row_id)];
 		data_ptr_t node = store_.PinFast(nid);
-		c.row_id = NodeRowId(node);
+		c.row_id = GetNodeRowId(node);
 	}
 	return cands;
 }

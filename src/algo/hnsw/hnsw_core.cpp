@@ -1,6 +1,7 @@
 #include "vindex/hnsw_core.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/helper.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -48,36 +49,53 @@ idx_t HnswCoreParams::NodeSize(idx_t code_size, uint8_t level) const {
 	return kHeaderPrefix + CountsSizeForLevel(level) + code_size + NeighborBlockSizeForLevel(*this, level);
 }
 
-int64_t &HnswCore::NodeRowId(data_ptr_t node) const {
-	return *reinterpret_cast<int64_t *>(node);
+int64_t HnswCore::GetNodeRowId(data_ptr_t node) const {
+	return Load<int64_t>(node);
 }
 
-uint32_t &HnswCore::NodeInternalId(data_ptr_t node) const {
-	return *reinterpret_cast<uint32_t *>(node + 8);
+void HnswCore::SetNodeRowId(data_ptr_t node, int64_t value) const {
+	Store<int64_t>(value, node);
 }
 
-uint8_t &HnswCore::NodeLevel(data_ptr_t node) const {
-	return *reinterpret_cast<uint8_t *>(node + 12);
+uint32_t HnswCore::GetNodeInternalId(data_ptr_t node) const {
+	return Load<uint32_t>(node + 8);
 }
 
-uint16_t *HnswCore::NeighborCounts(data_ptr_t node) const {
-	return reinterpret_cast<uint16_t *>(node + kHeaderPrefix);
+void HnswCore::SetNodeInternalId(data_ptr_t node, uint32_t value) const {
+	Store<uint32_t>(value, node + 8);
+}
+
+uint8_t HnswCore::GetNodeLevel(data_ptr_t node) const {
+	return Load<uint8_t>(node + 12);
+}
+
+void HnswCore::SetNodeLevel(data_ptr_t node, uint8_t value) const {
+	Store<uint8_t>(value, node + 12);
+}
+
+uint16_t HnswCore::GetNeighborCount(data_ptr_t node, uint8_t level) const {
+	return Load<uint16_t>(node + kHeaderPrefix + idx_t(level) * sizeof(uint16_t));
+}
+
+void HnswCore::SetNeighborCount(data_ptr_t node, uint8_t level, uint16_t value) const {
+	Store<uint16_t>(value, node + kHeaderPrefix + idx_t(level) * sizeof(uint16_t));
 }
 
 data_ptr_t HnswCore::NodeCode(data_ptr_t node) const {
-	const uint8_t level = *reinterpret_cast<const uint8_t *>(node + 12);
+	const uint8_t level = GetNodeLevel(node);
 	return node + kHeaderPrefix + CountsSizeForLevel(level);
 }
 
-BlockId *HnswCore::NeighborArray(data_ptr_t node, uint8_t layer) const {
+BlockId HnswCore::GetNeighborAt(data_ptr_t node, uint8_t layer, idx_t i) const {
 	data_ptr_t neigh_base = NodeCode(node) + code_size_;
-	idx_t offset = 0;
-	if (layer == 0) {
-		offset = 0;
-	} else {
-		offset = params_.m0 + idx_t(layer - 1) * params_.m;
-	}
-	return reinterpret_cast<BlockId *>(neigh_base) + offset;
+	idx_t offset = (layer == 0) ? 0 : (params_.m0 + idx_t(layer - 1) * params_.m);
+	return Load<BlockId>(neigh_base + (offset + i) * sizeof(BlockId));
+}
+
+void HnswCore::SetNeighborAt(data_ptr_t node, uint8_t layer, idx_t i, BlockId value) const {
+	data_ptr_t neigh_base = NodeCode(node) + code_size_;
+	idx_t offset = (layer == 0) ? 0 : (params_.m0 + idx_t(layer - 1) * params_.m);
+	Store<BlockId>(value, neigh_base + (offset + i) * sizeof(BlockId));
 }
 
 HnswCore::HnswCore(HnswCoreParams params, Quantizer &quantizer, IndexBlockStore &store)
@@ -178,7 +196,7 @@ vector<HnswCore::Candidate> HnswCore::SearchLayer(const float *query_preproc, Bl
 	}
 	{
 		data_ptr_t entry_ptr = store_.PinFast(entry);
-		visit_marks_[NodeInternalId(entry_ptr)] = visit_counter_;
+		visit_marks_[GetNodeInternalId(entry_ptr)] = visit_counter_;
 	}
 	cand.push({entry_dist, entry});
 	W.push({entry_dist, entry});
@@ -192,13 +210,11 @@ vector<HnswCore::Candidate> HnswCore::SearchLayer(const float *query_preproc, Bl
 			break;
 		}
 		data_ptr_t node = store_.PinFast(c.id);
-		const uint16_t *counts = NeighborCounts(node);
-		const uint16_t n = counts[layer];
-		const BlockId *neigh = NeighborArray(node, layer);
+		const uint16_t n = GetNeighborCount(node, layer);
 		for (uint16_t i = 0; i < n; i++) {
-			const BlockId nb = neigh[i];
+			const BlockId nb = GetNeighborAt(node, layer, i);
 			data_ptr_t nb_ptr = store_.PinFast(nb);
-			const uint32_t iid = NodeInternalId(nb_ptr);
+			const uint32_t iid = GetNodeInternalId(nb_ptr);
 			if (marks[iid] == vc) {
 				continue;
 			}
@@ -239,12 +255,10 @@ std::pair<BlockId, float> HnswCore::GreedySearch(const float *query_preproc, Blo
 		bool changed = true;
 		while (changed) {
 			changed = false;
-			data_ptr_t node = store_.PinFast(best);
-			const uint16_t *counts = NeighborCounts(node);
-			const uint16_t n = counts[layer];
-			const BlockId *neigh = NeighborArray(node, uint8_t(layer));
-			for (uint16_t i = 0; i < n; i++) {
-				const BlockId nb = neigh[i];
+		data_ptr_t node = store_.PinFast(best);
+		const uint16_t n = GetNeighborCount(node, uint8_t(layer));
+		for (uint16_t i = 0; i < n; i++) {
+			const BlockId nb = GetNeighborAt(node, uint8_t(layer), i);
 				const float d = NodeDistance(query_preproc, nb);
 				if (d < best_d) {
 					best_d = d;
@@ -318,14 +332,13 @@ void HnswCore::ConnectAndPrune(BlockId new_node, const float * /*query_preproc*/
                                uint8_t layer) {
 	{
 		data_ptr_t n = store_.PinFast(new_node);
-		uint16_t *counts = NeighborCounts(n);
-		BlockId *arr = NeighborArray(n, layer);
 		const idx_t cap = NeighborCapacity(layer);
-		counts[layer] = uint16_t(std::min<idx_t>(selected.size(), cap));
-		for (idx_t i = 0; i < counts[layer]; i++) {
+		const uint16_t count = uint16_t(std::min<idx_t>(selected.size(), cap));
+		SetNeighborCount(n, layer, count);
+		for (idx_t i = 0; i < count; i++) {
 			BlockId nb;
 			nb.Set(idx_t(selected[i].row_id));
-			arr[i] = nb;
+			SetNeighborAt(n, layer, i, nb);
 		}
 	}
 
@@ -346,17 +359,21 @@ void HnswCore::ConnectAndPrune(BlockId new_node, const float * /*query_preproc*/
 		BlockId sid;
 		sid.Set(idx_t(s.row_id));
 		data_ptr_t sn = store_.PinFast(sid);
-		uint16_t *counts = NeighborCounts(sn);
-		BlockId *arr = NeighborArray(sn, layer);
 		const idx_t cap = NeighborCapacity(layer);
-		if (counts[layer] < cap) {
-			arr[counts[layer]++] = new_node;
+		uint16_t count = GetNeighborCount(sn, layer);
+		if (count < cap) {
+			SetNeighborAt(sn, layer, count, new_node);
+			SetNeighborCount(sn, layer, uint16_t(count + 1));
 			continue;
 		}
 		// Snapshot s's code, its existing neighbors, and their codes.
 		vector<data_t> s_code(cs);
 		std::memcpy(s_code.data(), NodeCode(sn), cs);
-		vector<BlockId> existing(arr, arr + cap);
+		vector<BlockId> existing;
+		existing.reserve(cap);
+		for (idx_t i = 0; i < cap; i++) {
+			existing.push_back(GetNeighborAt(sn, layer, i));
+		}
 
 		// Build candidate list: each (d(s,w), BlockId, code). d(new,s) = s.distance.
 		struct Cand {
@@ -399,11 +416,9 @@ void HnswCore::ConnectAndPrune(BlockId new_node, const float * /*query_preproc*/
 		}
 
 		data_ptr_t sn2 = store_.PinFast(sid);
-		uint16_t *counts2 = NeighborCounts(sn2);
-		BlockId *arr2 = NeighborArray(sn2, layer);
-		counts2[layer] = uint16_t(kept.size());
+		SetNeighborCount(sn2, layer, uint16_t(kept.size()));
 		for (idx_t i = 0; i < kept.size(); i++) {
-			arr2[i] = kept[i];
+			SetNeighborAt(sn2, layer, i, kept[i]);
 		}
 	}
 }
@@ -427,9 +442,9 @@ BlockId HnswCore::Insert(int64_t row_id, const float *vec) {
 	{
 		data_ptr_t n = store_.PinFast(new_id);
 		std::memset(n, 0, node_sizes_[level]);
-		NodeRowId(n) = row_id;
-		NodeInternalId(n) = internal_id;
-		NodeLevel(n) = level;
+		SetNodeRowId(n, row_id);
+		SetNodeInternalId(n, internal_id);
+		SetNodeLevel(n, level);
 		quantizer_.Encode(vec, NodeCode(n));
 	}
 
@@ -504,7 +519,7 @@ vector<HnswCore::Candidate> HnswCore::Search(const float *query_preproc, idx_t k
 		BlockId id;
 		id.Set(idx_t(c.row_id));
 		data_ptr_t n = store_.PinFast(id);
-		c.row_id = NodeRowId(n);
+		c.row_id = GetNodeRowId(n);
 	}
 	return cands;
 }

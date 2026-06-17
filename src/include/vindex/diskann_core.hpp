@@ -3,6 +3,7 @@
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/helper.hpp"
 
 #include "vindex/index_block_store.hpp"
 #include "vindex/quantizer.hpp"
@@ -80,19 +81,38 @@ private:
 	//   uint16_t neighbor_count
 	//   uint16_t _pad
 	//   BlockId  neighbors[R]
+	//
+	// All typed sub-fields are read/written via Get/Set pairs backed by
+	// duckdb::Load<T> / duckdb::Store<T>. Although DiskANN's fixed
+	// 16 + R*8 layout happens to be naturally 8-aligned today, the
+	// Load/Store pattern is well-defined regardless of offset and matches
+	// the convention used by HNSW (and DuckDB core, e.g. radix.hpp,
+	// bitpacking.hpp). Compilers lower it to a single load/store.
 	static constexpr idx_t kHeaderBytes = 16;
 
-	int64_t &NodeRowId(data_ptr_t node) const {
-		return *reinterpret_cast<int64_t *>(node);
+	int64_t GetNodeRowId(data_ptr_t node) const {
+		return Load<int64_t>(node);
 	}
-	uint32_t &NodeInternalId(data_ptr_t node) const {
-		return *reinterpret_cast<uint32_t *>(node + 8);
+	void SetNodeRowId(data_ptr_t node, int64_t value) const {
+		Store<int64_t>(value, node);
 	}
-	uint16_t &NeighborCount(data_ptr_t node) const {
-		return *reinterpret_cast<uint16_t *>(node + 12);
+	uint32_t GetNodeInternalId(data_ptr_t node) const {
+		return Load<uint32_t>(node + 8);
 	}
-	BlockId *NeighborArray(data_ptr_t node) const {
-		return reinterpret_cast<BlockId *>(node + kHeaderBytes);
+	void SetNodeInternalId(data_ptr_t node, uint32_t value) const {
+		Store<uint32_t>(value, node + 8);
+	}
+	uint16_t GetNeighborCount(data_ptr_t node) const {
+		return Load<uint16_t>(node + 12);
+	}
+	void SetNeighborCount(data_ptr_t node, uint16_t value) const {
+		Store<uint16_t>(value, node + 12);
+	}
+	BlockId GetNeighborAt(data_ptr_t node, idx_t i) const {
+		return Load<BlockId>(node + kHeaderBytes + i * sizeof(BlockId));
+	}
+	void SetNeighborAt(data_ptr_t node, idx_t i, BlockId value) const {
+		Store<BlockId>(value, node + kHeaderBytes + i * sizeof(BlockId));
 	}
 
 	const_data_ptr_t CodeOf(uint32_t internal_id) const {

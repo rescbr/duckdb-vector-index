@@ -111,12 +111,27 @@ private:
 	//   BlockId neighbors_l1[m]
 	//   ...
 	//   BlockId neighbors_lL[m]       (L = max_level)
-	int64_t &NodeRowId(data_ptr_t node) const;
-	uint32_t &NodeInternalId(data_ptr_t node) const;
-	uint8_t &NodeLevel(data_ptr_t node) const;
-	uint16_t *NeighborCounts(data_ptr_t node) const;
+	//
+	// All typed sub-fields (everything except the byte-aligned code section
+	// returned as data_ptr_t by NodeCode) are read/written via Get/Set pairs
+	// backed by duckdb::Load<T> / duckdb::Store<T>. The FixedSizeAllocator
+	// base is 8-aligned, but sub-fields at non-8-stride offsets (e.g.
+	// neighbor_count at offset 16 + 2·level, or the BlockId neighbor array
+	// when code_size is not a multiple of 8 — common with RaBitQ's 12-byte
+	// trailer) land on non-natural boundaries. Load/Store lower to a single
+	// load/store instruction and are well-defined by the C++ memory model
+	// regardless of the runtime offset. See duckdb/common/helper.hpp.
+	int64_t GetNodeRowId(data_ptr_t node) const;
+	void SetNodeRowId(data_ptr_t node, int64_t value) const;
+	uint32_t GetNodeInternalId(data_ptr_t node) const;
+	void SetNodeInternalId(data_ptr_t node, uint32_t value) const;
+	uint8_t GetNodeLevel(data_ptr_t node) const;
+	void SetNodeLevel(data_ptr_t node, uint8_t value) const;
+	uint16_t GetNeighborCount(data_ptr_t node, uint8_t level) const;
+	void SetNeighborCount(data_ptr_t node, uint8_t level, uint16_t value) const;
 	data_ptr_t NodeCode(data_ptr_t node) const;
-	BlockId *NeighborArray(data_ptr_t node, uint8_t layer) const;
+	BlockId GetNeighborAt(data_ptr_t node, uint8_t layer, idx_t i) const;
+	void SetNeighborAt(data_ptr_t node, uint8_t layer, idx_t i, BlockId value) const;
 
 	idx_t NeighborCapacity(uint8_t layer) const {
 		return layer == 0 ? params_.m0 : params_.m;

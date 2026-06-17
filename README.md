@@ -3,7 +3,9 @@
 A DuckDB extension for **vector similarity search at scale**. Superset of the
 official [`vss`](https://github.com/duckdb/duckdb-vss) extension: supports
 HNSW, IVF (IVF-Flat / IVF-RaBitQ / IVF-PQ / IVF-ScaNN), DiskANN (Vamana
-graph with codes held out-of-band so the graph can evict past RAM), and
+graph with codes held out-of-band so the graph can evict past RAM),
+AiSAQ (Vamana graph whose PQ codes are paged from DuckDB's BufferPool on
+demand, enabling indexes larger than RAM), and
 SPANN (IVF with closure-replica writes so boundary points survive a
 single-cell probe), with pluggable quantization — RaBitQ (bits ∈
 {1,2,3,4,5,7,8}, default **3-bit**), PQ, and ScaNN anisotropic PQ — plus
@@ -41,7 +43,7 @@ LOAD vindex;
 No `-unsigned` flag or `allow_unsigned_extensions` is required — the
 community-extensions pipeline signs each `vindex.duckdb_extension` binary
 after build. DuckDB versions must match the one vindex was built against
-(currently **v1.5.2**).
+(currently **v1.5.3**).
 
 ### From source
 
@@ -111,6 +113,13 @@ CREATE INDEX docs_idx ON docs USING DISKANN (embedding)
 CREATE INDEX docs_idx ON docs USING SPANN (embedding)
     WITH (metric='cosine', quantizer='rabitq', bits=3, rerank=10,
           nlist=1024, nprobe=32, replica_count=8, closure_factor=1.1);
+
+-- AiSAQ — paged-PQ Vamana graph. PQ codes live in DuckDB blocks and are
+-- paged on demand, so the index scales past RAM. Accepts PQ or ScaNN only.
+-- Recall@10 ≥ 0.95 on SIFT1M.
+CREATE INDEX docs_idx ON docs USING AISAQ (embedding)
+    WITH (metric='l2sq', quantizer='pq', m=16, bits=8, rerank=10,
+          aisaq_r=64, aisaq_l=100);
 
 -- Query uses the standard DuckDB distance function; the index kicks in.
 SELECT id, embedding
@@ -200,6 +209,10 @@ table just pins the `WITH (…)` defaults so you know what you're overriding:
 | `pq`     | 8 | `bits` ∈ {4, 8}; `m` defaults to `dim/4` |
 | `scann`  | 8 | `bits` ∈ {4, 8}; `m` defaults to `dim/4`; `eta` (default 4) |
 
+> **AiSAQ** accepts only `pq` and `scann` — it requires a LUT-capable
+> compressing quantizer. `flat` (stores full fp32, defeats the paged layout)
+> and `rabitq` (no LUT distance path) are rejected at `CREATE INDEX` time.
+
 ### Quantizer bits vs recall
 
 Low-bit RaBitQ is a **coarse filter** — on its own the estimated distances are
@@ -253,14 +266,120 @@ This is enforced by `test/sql/hnsw/hnsw_rerank.test`. There is no
 "skip rerank" shortcut — the upstream operator is always the exact-distance
 step, which is why `bits=1 + rerank=20` can recover >99% Recall@10.
 
+## AiSAQ — paged-PQ vector search
+
+AiSAQ ("All-in-Storage ANNS") is a single-layer Vamana graph whose PQ codes
+are stored in DuckDB blocks and paged through the BufferPool on demand. Unlike
+DiskANN (which holds PQ codes in contiguous RAM), AiSAQ's codes are
+evictable — the index can grow larger than RAM, with cold PQ pages evicted by
+DuckDB's global `memory_limit` and re-paged on access.
+
+### When to choose AiSAQ vs DiskANN
+
+| | DiskANN | AiSAQ |
+|---|---|---|
+| PQ codes during build | RAM-resident (fast) | RAM-resident (flat buffer, same speed) |
+| PQ codes at search | RAM-resident | Paged from BufferPool (evictable) |
+| Memory beyond RAM | Graph only; codes must fit | Graph + codes evictable |
+| Search latency | Lower (pointer arithmetic) | Higher (BufferPool pin per code) |
+| Best for | Datasets that fit in RAM | Datasets that exceed RAM |
+
+### Build acceleration
+
+AiSAQ supports a three-tier build acceleration system controlled by
+`WITH (build_strategy=...)` or the session option
+`SET vindex_aisaq_build_strategy=...`:
+
+| Strategy | Description | Memory cost | Build speed |
+|---|---|---|---|
+| `auto` *(default)* | Picks the best tier that fits in RAM budget | — | — |
+| `pq_buffer` | Flat PQ code + graph node buffers in RAM during build | `N × (code_size + node_size)` | Fast (zero I/O) |
+| `paged` | Per-prune gather; PQ codes read from BufferPool | ~1.6 KB per prune call | Slower (BufferPool pins) |
+| `exact_prune` | Same as `pq_buffer` but uses full-precision vectors for prune distances | `N × (code_size + node_size + dim×4)` | **8× slower** than `pq_buffer`; best recall |
+
+The `auto` strategy picks `pq_buffer` when `N × (code_size + node_size)` fits
+in 25% of `memory_limit` (overridable via `WITH (ram_budget_mb=...)`), falling
+back to `paged` otherwise. `exact_prune` is always opt-in — it mirrors the
+reference `aisaq-diskann` implementation's use of full-precision prune
+distances, giving marginally better graph quality at 8× the build cost.
+
+```sql
+-- Explicit strategy override:
+CREATE INDEX idx ON t USING AISAQ(vec)
+    WITH (quantizer='pq', m=16, bits=8, aisaq_r=64, aisaq_l=100, build_strategy='exact_prune');
+
+-- Session-level override:
+SET vindex_aisaq_build_strategy = 'paged';
+
+-- Explicit RAM budget (MB) for build-time flat buffers:
+CREATE INDEX idx ON t USING AISAQ(vec)
+    WITH (quantizer='pq', m=16, bits=8, ram_budget_mb=2048);
+```
+
+### Key parameters
+
+| Option | Default | Range | Description |
+|---|---|---|---|
+| `aisaq_r` | 64 | 4–256 | Graph out-degree (R) |
+| `aisaq_l` | 100 | 4–1024 | Search beam width (L) |
+| `aisaq_l_build` | = `aisaq_r` | 4–1024 | Build beam width (decoupled from search; Vamana paper recommends L_build ≈ R) |
+| `aisaq_alpha` | 1.2 | 1.0–2.0 | RobustPrune relaxation factor |
+| `aisaq_inline_pq` | 0 | 0–`aisaq_r` | Inline PQ codes for first N neighbors (faster search, larger nodes) |
+| `aisaq_entry_points` | 16 | 1–64 | Number of cached entry points for search |
+| `aisaq_beam_width` | 8 | — | I/O batching hint for search |
+| `aisaq_io_limit` | 0 | — | Max PQ code page-ins per search (0 = unlimited) |
+
+### Label-column filtering
+
+AiSAQ supports label-filtered search via `WITH (label_column='cat')`, where
+`cat` must be a `BIGINT` column. When a `WHERE` predicate on `cat` is present,
+the optimizer routes it into the index scan:
+
+```sql
+CREATE INDEX idx ON docs USING AISAQ(embedding)
+    WITH (quantizer='pq', m=16, bits=8, label_column='category');
+
+-- EQUALS: uses the label's medoid as the single entry point
+SELECT id FROM docs WHERE category = 5
+    ORDER BY array_distance(embedding, [...]::FLOAT[768]) LIMIT 10;
+
+-- RANGE: adaptive — all matching medoids (≤ n_entry_points) or global fallback
+SELECT id FROM docs WHERE category BETWEEN 3 AND 7
+    ORDER BY array_distance(embedding, [...]::FLOAT[768]) LIMIT 10;
+```
+
+Supported operators: `=`, `>`, `>=`, `<`, `<=`, `BETWEEN`, and folded
+conjuncts (`cat > 1 AND cat < 5`). Non-literal predicates (subqueries, etc.)
+fall through to post-hoc filtering.
+
+### Logging
+
+Build progress and per-phase timing are available via the `vindex_log_level`
+session option or the `VINDEX_LOG_LEVEL` environment variable (env var
+overrides session option):
+
+```sql
+SET vindex_log_level = 'info';    -- phase milestones, throttled 2s
+SET vindex_log_level = 'debug';   -- per-page granularity
+SET vindex_log_level = 'profile'; -- per-insert timing breakdowns
+```
+
+```sh
+VINDEX_LOG_LEVEL=info python3 test/bench/run_recall.py --algo aisaq-pq
+```
+
+Output goes to stderr (sqllogictest-safe). Default is `off`. See AGENTS.md
+"Profiling" section for samply profiling instructions.
+
 ## Repository layout
 
 ```text
 src/                    C++ extension source
-  include/vindex/       public headers (VectorIndex, Quantizer, ...)
+  include/vindex/       public headers (VectorIndex, Quantizer, logging, ...)
   common/               optimizers, registry, block store
-  algo/<name>/          one subdirectory per algorithm
+  algo/<name>/          one subdirectory per algorithm (hnsw, ivf, diskann, spann, aisaq)
   quant/<name>/         one subdirectory per quantizer
+  backend/              abstract Backend + CpuBackend (Phase 4)
 test/
   sql/                  sqllogictest (.test files)
   unit/                 Catch2 kernel tests
@@ -277,6 +396,7 @@ make                     # release build → build/release/extension/vindex/
 make test                # SQL logic tests (test/sql/)
 make unit                # Catch2 unit tests (test/unit/)
 make bench               # recall regression on siftsmall (~5 s, auto-downloads)
+python3 test/bench/run_recall.py --algo aisaq-pq --dataset sift1m  # AiSAQ on SIFT1M
 ```
 
 `make bench` downloads the [siftsmall](http://corpus-texmex.irisa.fr/)

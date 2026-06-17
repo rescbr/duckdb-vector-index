@@ -173,8 +173,8 @@ main
 | 3 | [03-lut-virtuals.md](03-lut-virtuals.md) | `feat/aisaq` | 1 wk | `- [x]` | 2 |
 | 4 | [04-backend-interface.md](04-backend-interface.md) | `feat/aisaq` | 1 wk | `- [x]` | 3 |
 | 5 | [05-aisaq-core.md](05-aisaq-core.md) | `feat/aisaq` | 5-7 wks | `- [x]` | 4 |
-| 6 | [06-aisaq-label-integration.md](06-aisaq-label-integration.md) | `feat/aisaq` | 2-3 wks | `- [ ]` | 5 |
-| 7 | [07-tests-bench.md](07-tests-bench.md) | `feat/aisaq` | 1-2 wks | `- [ ]` | 6 |
+| 6 | [06-aisaq-label-integration.md](06-aisaq-label-integration.md) | `feat/aisaq` | 2-3 wks | `- [x]` | 5 |
+| 7 | [07-tests-bench.md](07-tests-bench.md) | `feat/aisaq` | 1-2 wks | `- [x]` | 6 |
 | 8 | [08-aisaq-vulkan.md](08-aisaq-vulkan.md) | `feat/aisaq-vulkan` | 8-12 wks | `- [ ]` | 7 |
 
 **Status legend**: `- [ ]` not started / `- [~]` in progress / `- [x]` complete / `- [!]` blocked

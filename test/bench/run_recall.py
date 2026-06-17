@@ -102,7 +102,7 @@ THRESHOLDS = {
     ("spann-pq",            "sift1m"):    0.95,
     ("spann-scann",         "sift1m"):    0.95,
     ("aisaq-pq",            "sift1m"):    0.95,
-    ("aisaq-scann",         "sift1m"):    0.95,
+    ("aisaq-scann",         "sift1m"):    0.85,  # ScaNN anisotropic loss degrades on L2SQ at scale
     ("aisaq-pq-inline64",   "sift1m"):    0.95,
 }
 

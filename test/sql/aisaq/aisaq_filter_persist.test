@@ -1,0 +1,102 @@
+# name: test/sql/aisaq/aisaq_filter_persist.test
+# group: [aisaq]
+#
+# Regression test for label-column filtering + checkpoint/restart round-trip.
+# Exercises the intersection of Phase 6 (label_column) and Phase 5 (persistence)
+# — the exact scenario fixed in the "options lost on restart" patch.
+#
+# Tests that:
+#   - label_column='cat' survives CHECKPOINT + restart
+#   - EQUALS / RANGE / folded conjunct filters all work post-restart
+#   - EXPLAIN still shows VINDEX_INDEX_SCAN with TOP_N
+#   - pragma reports correct index metadata
+
+require vindex
+
+load {TEST_DIR}/aisaq_filter_persist.db
+
+statement ok
+SET vindex_enable_experimental_persistence = true;
+
+statement ok
+CREATE TABLE t(id INTEGER, vec FLOAT[8], cat BIGINT);
+
+statement ok
+INSERT INTO t SELECT i::INTEGER, [((i%3)*100+i)::FLOAT, (i*0.1)::FLOAT, (i*0.01)::FLOAT, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8], (i%3)::BIGINT+1 FROM range(1, 501) t(i);
+
+statement ok
+CREATE INDEX idx ON t USING AISAQ(vec) WITH (quantizer='pq', m=4, bits=8, aisaq_r=16, aisaq_l=64, label_column='cat');
+
+# --- Pre-checkpoint: label filters work ----------------------------------
+
+query I
+SELECT count(*) FROM (SELECT id, cat FROM t WHERE cat = 1 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5) WHERE cat != 1
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, cat FROM t WHERE cat > 1 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5) WHERE cat <= 1
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id FROM t WHERE cat = 999 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5)
+----
+0
+
+query I
+SELECT count FROM pragma_vindex_aisaq_index_info() WHERE index_name = 'idx'
+----
+500
+
+# --- Checkpoint + restart ------------------------------------------------
+
+statement ok
+CHECKPOINT;
+
+restart
+
+statement ok
+SET vindex_enable_experimental_persistence = true;
+
+# --- Post-restart: label filters STILL work (the regression) -------------
+
+query II
+EXPLAIN SELECT id FROM t WHERE cat = 2 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5
+----
+physical_plan	<REGEX>:(?s).*TOP_N.*VINDEX_INDEX_SCAN.*
+
+query I
+SELECT count(*) FROM (SELECT id, cat FROM t WHERE cat = 1 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5) WHERE cat != 1
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, cat FROM t WHERE cat = 2 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5) WHERE cat != 2
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, cat FROM t WHERE cat > 1 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5) WHERE cat <= 1
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, cat FROM t WHERE cat BETWEEN 1 AND 2 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5) WHERE cat < 1 OR cat > 2
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, cat FROM t WHERE cat > 0 AND cat < 3 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5) WHERE cat <= 0 OR cat >= 3
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id FROM t WHERE cat = 999 ORDER BY array_distance(vec, [5,0,0,0,0,0,0,0]::FLOAT[8]) LIMIT 5)
+----
+0
+
+query I
+SELECT count FROM pragma_vindex_aisaq_index_info() WHERE index_name = 'idx'
+----
+500

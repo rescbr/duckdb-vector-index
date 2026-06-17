@@ -8,6 +8,7 @@
 #include "duckdb/storage/table/scan_state.hpp"
 
 #include "vindex/metric.hpp"
+#include "vindex/label_filter.hpp"
 
 namespace duckdb {
 class LogicalGet;
@@ -80,6 +81,28 @@ public:
 	virtual idx_t ExecuteMultiScan(IndexScanState &state, float *query_vector, idx_t limit) = 0;
 	virtual const Vector &GetMultiScanResult(IndexScanState &state) = 0;
 	virtual void ResetMultiScan(IndexScanState &state) = 0;
+
+	// --- label filtering (Phase 2: general infrastructure) -------------------
+	// Override to return true if this index type supports label-filtered
+	// search. Default: false (no algorithm supports it until it opts in).
+	virtual bool SupportsLabelFilter() const {
+		return false;
+	}
+
+	// Returns the column name designated as the label column at CREATE INDEX
+	// time via WITH (label_column = '...'), or empty string if none.
+	virtual const string &GetLabelColumn() const {
+		return label_column_;
+	}
+
+	// Parse label_column from the WITH (...) options map. Called by subclasses
+	// in InitFromOptions. Validates the value is a VARCHAR.
+	void ParseLabelColumn(const case_insensitive_map_t<Value> &options);
+
+protected:
+	// Designated label column (empty = no label filtering). Set by subclasses
+	// during construction from the WITH (label_column = '...') option.
+	string label_column_;
 
 private:
 	// Built lazily on first TryMatchDistanceFunction() call, when the subclass

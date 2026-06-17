@@ -7,6 +7,8 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 
+#include "vindex/label_filter.hpp"
+
 namespace duckdb {
 class Index;
 
@@ -24,6 +26,7 @@ struct VectorIndexScanBindData final : public TableScanBindData {
 	Index &index;
 	idx_t limit;
 	unsafe_unique_array<float> query;
+	LabelFilter label_filter; // active when index supports label filtering
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<VectorIndexScanBindData>();

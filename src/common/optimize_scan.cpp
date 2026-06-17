@@ -5,6 +5,8 @@
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -15,12 +17,143 @@
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/table_index_list.hpp"
 
+#include "vindex/label_filter.hpp"
 #include "vindex/vector_index.hpp"
 #include "vindex/vector_index_registry.hpp"
 #include "vindex/vector_index_scan.hpp"
 
 namespace duckdb {
 namespace vindex {
+
+// ---------------------------------------------------------------------------
+// Label-filter extraction helpers
+// ---------------------------------------------------------------------------
+
+// Convert a single ConstantFilter on a BIGINT label column to a partial
+// LabelFilter. Returns LabelFilter::None() if the filter type is not a
+// supported comparison.
+static LabelFilter ConstantFilterToLabel(const ConstantFilter &cf) {
+	const auto &val = cf.constant;
+	if (val.type().id() != LogicalTypeId::BIGINT && val.type().id() != LogicalTypeId::INTEGER &&
+	    val.type().id() != LogicalTypeId::TINYINT && val.type().id() != LogicalTypeId::SMALLINT) {
+		return LabelFilter::None();
+	}
+	const int64_t v = val.GetValue<int64_t>();
+	switch (cf.comparison_type) {
+		case ExpressionType::COMPARE_EQUAL:
+			return LabelFilter::Equals(v);
+		case ExpressionType::COMPARE_GREATERTHAN:
+			return LabelFilter::Range(v == INT64_MAX ? INT64_MAX : v + 1, INT64_MAX);
+		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+			return LabelFilter::Range(v, INT64_MAX);
+		case ExpressionType::COMPARE_LESSTHAN:
+			return LabelFilter::Range(INT64_MIN, v == INT64_MIN ? INT64_MIN : v - 1);
+		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+			return LabelFilter::Range(INT64_MIN, v);
+		default:
+			return LabelFilter::None();
+	}
+}
+
+// Fold multiple partial LabelFilters into one by intersection.
+// Equality dominates: if any partial is EQUALS(v), and v satisfies all
+// other partials, the result is EQUALS(v). Otherwise unsatisfiable.
+static LabelFilter FoldLabelFilters(const vector<LabelFilter> &partials) {
+	if (partials.size() == 1) {
+		return partials[0];
+	}
+	for (const auto &p : partials) {
+		if (p.kind == LabelFilter::Kind::EQUALS) {
+			for (const auto &q : partials) {
+				if (&p == &q) {
+					continue;
+				}
+				if (!q.Matches(p.value)) {
+					return LabelFilter::None();
+				}
+			}
+			return p;
+		}
+	}
+	int64_t lo = INT64_MIN, hi = INT64_MAX;
+	for (const auto &p : partials) {
+		if (p.kind != LabelFilter::Kind::RANGE) {
+			continue;
+		}
+		lo = std::max(lo, p.lo);
+		hi = std::min(hi, p.hi);
+	}
+	if (lo > hi) {
+		return LabelFilter::None();
+	}
+	return LabelFilter::Range(lo, hi);
+}
+
+// Recursively collect partial LabelFilters from a TableFilter tree.
+static void CollectLabelPartials(const TableFilter &filter, vector<LabelFilter> &out) {
+	switch (filter.filter_type) {
+		case TableFilterType::CONSTANT_COMPARISON: {
+			auto &cf = filter.Cast<ConstantFilter>();
+			auto partial = ConstantFilterToLabel(cf);
+			if (partial.IsActive()) {
+				out.push_back(partial);
+			}
+			break;
+		}
+		case TableFilterType::CONJUNCTION_AND: {
+			auto &conj = filter.Cast<ConjunctionAndFilter>();
+			for (auto &child : conj.child_filters) {
+				CollectLabelPartials(*child, out);
+			}
+			break;
+		}
+		default:
+			break;
+	}
+}
+
+// Try to extract a LabelFilter from the table filters on the designated
+// label column. Returns LabelFilter::None() if no label predicates are found
+// or the index does not support label filtering.
+static LabelFilter TryExtractLabelFilter(const VectorIndex &vi, LogicalGet &get) {
+	if (!vi.SupportsLabelFilter()) {
+		return LabelFilter::None();
+	}
+	const auto &label_col = vi.GetLabelColumn();
+	if (label_col.empty()) {
+		return LabelFilter::None();
+	}
+
+	// Resolve label column name → logical column ID by scanning the table's
+	// column definitions.
+	const auto &duck_table = get.GetTable()->Cast<DuckTableEntry>();
+	const auto &columns = duck_table.GetColumns();
+	idx_t label_logical_id = DConstants::INVALID_INDEX;
+	for (const auto &col : columns.Logical()) {
+		if (StringUtil::CIEquals(col.GetName(), label_col)) {
+			label_logical_id = col.Oid();
+			break;
+		}
+	}
+	if (label_logical_id == DConstants::INVALID_INDEX) {
+		return LabelFilter::None();
+	}
+
+	// Search the table filters for the label column.
+	for (const auto &entry : get.table_filters.filters) {
+		const idx_t filter_col_id = entry.first;
+		if (filter_col_id != label_logical_id) {
+			continue;
+		}
+		vector<LabelFilter> partials;
+		CollectLabelPartials(*entry.second, partials);
+		if (partials.empty()) {
+			return LabelFilter::None();
+		}
+		return FoldLabelFilters(partials);
+	}
+	return LabelFilter::None();
+}
 
 // ---------------------------------------------------------------------------
 // TopN → index scan rewrite
@@ -137,6 +270,8 @@ public:
 			const idx_t cand_limit = top_n.limit * rerank;
 			bind_data =
 			    make_uniq<VectorIndexScanBindData>(duck_table, index, cand_limit, std::move(query_vector));
+			// Extract label-column filter predicates if the index supports it.
+			bind_data->label_filter = TryExtractLabelFilter(*vi, get);
 			break;
 		}
 

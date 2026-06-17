@@ -1,6 +1,7 @@
 #include "vindex/vector_index.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/optimizer/matcher/expression_type_matcher.hpp"
 #include "duckdb/optimizer/matcher/function_matcher.hpp"
 #include "duckdb/optimizer/matcher/set_matcher.hpp"
@@ -16,6 +17,17 @@ VectorIndex::VectorIndex(const string &name, const string &type_name, IndexConst
                          const vector<column_t> &column_ids, TableIOManager &table_io_manager,
                          const vector<unique_ptr<Expression>> &unbound_expressions, AttachedDatabase &db)
     : BoundIndex(name, type_name, constraint_type, column_ids, table_io_manager, unbound_expressions, db) {
+}
+
+void VectorIndex::ParseLabelColumn(const case_insensitive_map_t<Value> &options) {
+	auto it = options.find("label_column");
+	if (it == options.end()) {
+		return;
+	}
+	if (it->second.type() != LogicalType::VARCHAR) {
+		throw BinderException("label_column must be a VARCHAR (column name)");
+	}
+	label_column_ = it->second.GetValue<string>();
 }
 
 unique_ptr<ExpressionMatcher> VectorIndex::BuildDistanceMatcher() const {

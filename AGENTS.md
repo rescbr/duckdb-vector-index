@@ -168,7 +168,6 @@ src/quant/<name>/               pluggable quantizers (flat, rabitq, pq, scann)
 src/common/optimize_*.cpp       shared planner rules; enumerate the registry, never hard-code algos
 src/common/vector_index_scan.cpp  the only index-scan operator; all algos go through it
 src/common/index_block_store.cpp  shared block/pager substrate (DiskANN, SPANN, HNSW)
-src/backend/                    abstract Backend + CpuBackend (Phase 4); VulkanBackend (Phase 8)
 src/algo/aisaq/aisaq_block_store.{cpp,hpp}  AiSAQ-specific storage via BlockManager (not IndexBlockStore)
 src/include/vindex/logging.hpp  LogLevel enum + GetLogLevel() (env var + session option)
 src/include/vindex/label_filter.hpp  LabelFilter struct (Phase 2/6 WHERE-label infra)

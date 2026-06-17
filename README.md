@@ -379,7 +379,6 @@ src/                    C++ extension source
   common/               optimizers, registry, block store
   algo/<name>/          one subdirectory per algorithm (hnsw, ivf, diskann, spann, aisaq)
   quant/<name>/         one subdirectory per quantizer
-  backend/              abstract Backend + CpuBackend (Phase 4)
 test/
   sql/                  sqllogictest (.test files)
   unit/                 Catch2 kernel tests

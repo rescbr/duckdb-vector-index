@@ -62,10 +62,6 @@ void RegisterBuiltInAlgorithms(ExtensionLoader &loader) {
 	// 2) Shared optimizers — registered once, dispatch via VectorIndexRegistry.
 	auto &db = loader.GetDatabaseInstance();
 
-	if (!db.config.GetOptionByName("vindex_gpu_backend")) {
-		db.config.AddExtensionOption("vindex_gpu_backend", "GPU backend for vector index operations (cpu, vulkan)",
-		                             LogicalType::VARCHAR, Value("cpu"));
-	}
 	if (!db.config.GetOptionByName("vindex_log_level")) {
 		db.config.AddExtensionOption("vindex_log_level",
 		                             "vindex logging verbosity: 'off' (default), 'info', 'debug', 'profile'. "

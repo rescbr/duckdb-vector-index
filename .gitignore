@@ -18,6 +18,7 @@ test/bench/datasets/
 test/bench/results/
 
 doc/
+docs/
 CLAUDE.md
 .cache
 ref/

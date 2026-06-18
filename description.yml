@@ -2,11 +2,13 @@
 extension:
   name: vindex
   description: |
-    Vector similarity search for DuckDB. Supports HNSW, IVF, and DiskANN
-    indexes with pluggable quantization (flat, RaBitQ, PQ); RaBitQ at 3
-    bits delivers >99% Recall@10 on SIFT1M with an optimizer-level rerank
-    pass.
-  version: 0.1.0
+    Vector similarity search for DuckDB. Supports HNSW, IVF, DiskANN, and
+    AiSAQ indexes with pluggable quantization (flat, RaBitQ, PQ, ScaNN);
+    RaBitQ at 3 bits delivers >99% Recall@10 on SIFT1M with an
+    optimizer-level rerank pass. AiSAQ pages PQ codes from storage on
+    demand via DuckDB's BlockManager, enabling indexing datasets larger
+    than RAM.
+  version: 0.2.0
   language: C++
   build: cmake
   license: MIT
@@ -15,7 +17,7 @@ extension:
 
 repo:
   github: Icemap/duckdb-vector-index
-  ref: v0.1.0
+  ref: v0.2.0
 
 docs:
   # Community-extensions serves these on duckdb.org/community_extensions/

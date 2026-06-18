@@ -10,6 +10,7 @@
 #include "vindex/metric.hpp"
 #include "vindex/quantizer.hpp"
 #include "vindex/unaligned.hpp"
+#include "vindex/vamana.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -141,8 +142,7 @@ class AiSaqCore {
 	}
 	// Pre-size internal buffers for construction (avoids repeated realloc).
 	void PrepareForBuild(idx_t estimated_count) {
-		visit_marks_.assign(estimated_count, 0);
-		visit_counter_ = 0;
+		tls_.PrepareForBuild(estimated_count);
 	}
 
 	idx_t Size() const {
@@ -315,10 +315,11 @@ class AiSaqCore {
 	// Sorted label keys for efficient range queries (lower_bound/upper_bound).
 	vector<int64_t> sorted_labels_;
 
-	mutable vector<uint32_t> visit_marks_;
-	mutable uint32_t visit_counter_ = 0;
-	mutable std::mt19937_64 rng_;
-	mutable vector<uint8_t> prune_scratch_; // reused across RobustPrune calls
+	// Per-call Vamana scratch (visit-mark table, prune gather buffer, RNG).
+	// Marked mutable because BeamSearch / RobustPrune are const but bump the
+	// epoch and reuse the scratch. In Task 5 this is lifted to a per-thread
+	// parameter to make concurrent primitives safe by construction.
+	mutable vamana::VamanaTLS tls_;
 };
 
 } // namespace aisaq

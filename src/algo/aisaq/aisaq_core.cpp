@@ -41,7 +41,7 @@ struct WorkingCmp {
 } // namespace
 
 AiSaqCore::AiSaqCore(AiSaqCoreParams params, Quantizer &quantizer, AiSaqBlockStore &store)
-    : params_(params), quantizer_(quantizer), store_(store), rng_(params.seed) {
+    : params_(params), quantizer_(quantizer), store_(store), tls_(params.seed) {
 	if (params_.R == 0) {
 		throw InternalException("AiSaqCore: R must be >= 1");
 	}
@@ -104,12 +104,7 @@ vector<AiSaqCore::Candidate> AiSaqCore::BeamSearch(const float *query_lut, idx_t
 	}
 	L = std::max<idx_t>(L, 1);
 
-	visit_counter_++;
-	if (visit_counter_ == 0) {
-		std::fill(visit_marks_.begin(), visit_marks_.end(), 0);
-		visit_counter_ = 1;
-	}
-	const uint32_t vc = visit_counter_;
+	const uint32_t vc = tls_.NextVisitEpoch();
 
 	std::priority_queue<FrontierItem, std::vector<FrontierItem>, FrontierCmp> frontier;
 	std::priority_queue<WorkingItem, std::vector<WorkingItem>, WorkingCmp> W;
@@ -119,13 +114,13 @@ vector<AiSaqCore::Candidate> AiSaqCore::BeamSearch(const float *query_lut, idx_t
 	// Seed entry points.
 	if (forced_entry_points && !forced_entry_points->empty()) {
 		for (uint32_t ep_id : *forced_entry_points) {
-			if (ep_id >= visit_marks_.size()) {
-				visit_marks_.resize(std::max<size_t>(visit_marks_.size() * 2, size_t(ep_id) + 1), 0);
+			if (ep_id >= tls_.visit_marks.size()) {
+				tls_.visit_marks.resize(std::max<size_t>(tls_.visit_marks.size() * 2, size_t(ep_id) + 1), 0);
 			}
-			if (visit_marks_[ep_id] == vc) {
+			if (tls_.visit_marks[ep_id] == vc) {
 				continue;
 			}
-			visit_marks_[ep_id] = vc;
+			tls_.visit_marks[ep_id] = vc;
 			io_count++;
 			const float d = DistanceToCode(query_lut, ep_id);
 			frontier.push({d, ep_id});
@@ -136,11 +131,11 @@ vector<AiSaqCore::Candidate> AiSaqCore::BeamSearch(const float *query_lut, idx_t
 		}
 	} else {
 		const uint32_t entry_internal = PickEntryPoint(query_lut);
-		if (entry_internal >= visit_marks_.size()) {
-			visit_marks_.resize(
-			    std::max<size_t>(visit_marks_.size() * 2, size_t(entry_internal) + 1), 0);
+		if (entry_internal >= tls_.visit_marks.size()) {
+			tls_.visit_marks.resize(
+			    std::max<size_t>(tls_.visit_marks.size() * 2, size_t(entry_internal) + 1), 0);
 		}
-		visit_marks_[entry_internal] = vc;
+		tls_.visit_marks[entry_internal] = vc;
 		io_count++;
 		const float entry_dist = DistanceToCode(query_lut, entry_internal);
 		frontier.push({entry_dist, entry_internal});
@@ -162,13 +157,13 @@ vector<AiSaqCore::Candidate> AiSaqCore::BeamSearch(const float *query_lut, idx_t
 		const uint16_t n = GetNeighborCount(nref.ptr);
 		for (uint16_t i = 0; i < n; i++) {
 			const uint32_t nb_internal = GetNeighbor(nref.ptr, i);
-			if (nb_internal >= visit_marks_.size()) {
-				visit_marks_.resize(std::max<size_t>(visit_marks_.size() * 2, size_t(nb_internal) + 1), 0);
+			if (nb_internal >= tls_.visit_marks.size()) {
+				tls_.visit_marks.resize(std::max<size_t>(tls_.visit_marks.size() * 2, size_t(nb_internal) + 1), 0);
 			}
-			if (visit_marks_[nb_internal] == vc) {
+			if (tls_.visit_marks[nb_internal] == vc) {
 				continue;
 			}
-			visit_marks_[nb_internal] = vc;
+			tls_.visit_marks[nb_internal] = vc;
 
 			// Label filtering: skip neighbors whose label doesn't match.
 			if (label_filter && label_filter->IsActive()) {
@@ -264,10 +259,10 @@ vector<AiSaqCore::Candidate> AiSaqCore::RobustPrune(const float * /*query_lut*/,
 	vector<uint8_t> local_codes;
 	const bool need_gather = !build_codes_ && !build_vectors_;
 	if (need_gather) {
-		prune_scratch_.resize(n * code_size_);
+		tls_.prune_scratch.resize(n * code_size_);
 		for (idx_t i = 0; i < n; i++) {
 			auto ref = ReadPqCode(uint32_t(candidates[i].row_id));
-			std::memcpy(prune_scratch_.data() + i * code_size_, ref.ptr, code_size_);
+			std::memcpy(tls_.prune_scratch.data() + i * code_size_, ref.ptr, code_size_);
 		}
 	}
 
@@ -287,8 +282,8 @@ vector<AiSaqCore::Candidate> AiSaqCore::RobustPrune(const float * /*query_lut*/,
 			}
 			float d_pp;
 			if (need_gather) {
-				d_pp = quantizer_.CodeDistance(prune_scratch_.data() + p_idx * code_size_,
-				                                prune_scratch_.data() + pp_idx * code_size_);
+				d_pp = quantizer_.CodeDistance(tls_.prune_scratch.data() + p_idx * code_size_,
+				                                tls_.prune_scratch.data() + pp_idx * code_size_);
 			} else {
 				d_pp = CodeDistance(uint32_t(candidates[p_idx].row_id), uint32_t(candidates[pp_idx].row_id));
 			}
@@ -384,8 +379,8 @@ uint32_t AiSaqCore::Insert(int64_t row_id, const float *vec, int64_t label) {
 		SetInlinePqCount(nref.ptr, params_.inline_pq_count);
 	}
 
-	if (internal_id >= visit_marks_.size()) {
-		visit_marks_.resize(std::max<size_t>(visit_marks_.size() * 2, size_t(internal_id) + 1), 0);
+	if (internal_id >= tls_.visit_marks.size()) {
+		tls_.visit_marks.resize(std::max<size_t>(tls_.visit_marks.size() * 2, size_t(internal_id) + 1), 0);
 	}
 
 	// Label bookkeeping.
@@ -744,8 +739,8 @@ void AiSaqCore::DeserializeState(const_data_ptr_t in, idx_t size) {
 		std::sort(sorted_labels_.begin(), sorted_labels_.end());
 	}
 
-	visit_marks_.assign(size_, 0);
-	visit_counter_ = 0;
+	tls_.visit_marks.assign(size_, 0);
+	tls_.visit_counter = 0;
 }
 
 } // namespace aisaq

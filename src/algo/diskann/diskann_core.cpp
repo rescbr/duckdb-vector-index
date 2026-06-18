@@ -38,7 +38,7 @@ struct WorkingCmp {
 } // namespace
 
 DiskAnnCore::DiskAnnCore(DiskAnnCoreParams params, Quantizer &quantizer, IndexBlockStore &store)
-    : params_(params), quantizer_(quantizer), store_(store), rng_(params.seed) {
+    : params_(params), quantizer_(quantizer), store_(store), tls_(params.seed) {
 	if (params_.R == 0) {
 		throw InternalException("DiskAnnCore: R must be >= 1");
 	}
@@ -67,12 +67,7 @@ vector<DiskAnnCore::Candidate> DiskAnnCore::BeamSearch(const float *query_prepro
 	}
 
 	// Bump visit epoch. Overflow after 2^32 searches — rezero the table.
-	visit_counter_++;
-	if (visit_counter_ == 0) {
-		std::fill(visit_marks_.begin(), visit_marks_.end(), 0);
-		visit_counter_ = 1;
-	}
-	const uint32_t vc = visit_counter_;
+	const uint32_t vc = tls_.NextVisitEpoch();
 
 	std::priority_queue<FrontierItem, std::vector<FrontierItem>, FrontierCmp> frontier;
 	std::priority_queue<WorkingItem, std::vector<WorkingItem>, WorkingCmp> W;
@@ -82,10 +77,10 @@ vector<DiskAnnCore::Candidate> DiskAnnCore::BeamSearch(const float *query_prepro
 		return GetNodeInternalId(e);
 	})();
 	const float entry_dist = DistanceToCode(query_preproc, entry_internal);
-	if (entry_internal >= visit_marks_.size()) {
-		visit_marks_.resize(std::max<size_t>(visit_marks_.size() * 2, size_t(entry_internal) + 1), 0);
+	if (entry_internal >= tls_.visit_marks.size()) {
+		tls_.visit_marks.resize(std::max<size_t>(tls_.visit_marks.size() * 2, size_t(entry_internal) + 1), 0);
 	}
-	visit_marks_[entry_internal] = vc;
+	tls_.visit_marks[entry_internal] = vc;
 	frontier.push({entry_dist, entry_internal});
 	W.push({entry_dist, entry_internal});
 
@@ -104,13 +99,13 @@ vector<DiskAnnCore::Candidate> DiskAnnCore::BeamSearch(const float *query_prepro
 			BlockId nb_block = GetNeighborAt(node, i);
 			data_ptr_t nb_node = store_.PinFast(nb_block);
 			const uint32_t nb_internal = GetNodeInternalId(nb_node);
-			if (nb_internal >= visit_marks_.size()) {
-				visit_marks_.resize(std::max<size_t>(visit_marks_.size() * 2, size_t(nb_internal) + 1), 0);
+			if (nb_internal >= tls_.visit_marks.size()) {
+				tls_.visit_marks.resize(std::max<size_t>(tls_.visit_marks.size() * 2, size_t(nb_internal) + 1), 0);
 			}
-			if (visit_marks_[nb_internal] == vc) {
+			if (tls_.visit_marks[nb_internal] == vc) {
 				continue;
 			}
-			visit_marks_[nb_internal] = vc;
+			tls_.visit_marks[nb_internal] = vc;
 			const float d = DistanceToCode(query_preproc, nb_internal);
 			if (W.size() < L || d < W.top().dist) {
 				frontier.push({d, nb_internal});
@@ -241,8 +236,8 @@ BlockId DiskAnnCore::Insert(int64_t row_id, const float *vec) {
 		SetNeighborCount(n, 0);
 	}
 	node_blocks_.push_back(new_id);
-	if (internal_id >= visit_marks_.size()) {
-		visit_marks_.resize(std::max<size_t>(visit_marks_.size() * 2, size_t(internal_id) + 1), 0);
+	if (internal_id >= tls_.visit_marks.size()) {
+		tls_.visit_marks.resize(std::max<size_t>(tls_.visit_marks.size() * 2, size_t(internal_id) + 1), 0);
 	}
 
 	if (size_ == 0) {
@@ -384,8 +379,8 @@ void DiskAnnCore::DeserializeState(const_data_ptr_t in, idx_t size) {
 		bid.Set(Consume<uint64_t>(cur, end));
 		node_blocks_.push_back(bid);
 	}
-	visit_marks_.assign(size_, 0);
-	visit_counter_ = 0;
+	tls_.visit_marks.assign(size_, 0);
+	tls_.visit_counter = 0;
 }
 
 } // namespace vindex

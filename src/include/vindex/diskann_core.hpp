@@ -7,6 +7,7 @@
 
 #include "vindex/index_block_store.hpp"
 #include "vindex/quantizer.hpp"
+#include "vindex/vamana.hpp"
 
 #include <cstdint>
 #include <random>
@@ -77,7 +78,7 @@ public:
 private:
 	// Node layout (fixed per-node size = kHeaderBytes + R * sizeof(BlockId)):
 	//   int64_t  row_id
-	//   uint32_t internal_id   (indexes codes_ and visit_marks_)
+	//   uint32_t internal_id   (indexes codes_ and tls_.visit_marks)
 	//   uint16_t neighbor_count
 	//   uint16_t _pad
 	//   BlockId  neighbors[R]
@@ -167,9 +168,12 @@ private:
 	BlockId entry_;
 	idx_t size_ = 0;
 
-	mutable vector<uint32_t> visit_marks_;
-	mutable uint32_t visit_counter_ = 0;
-	mutable std::mt19937_64 rng_;
+	// Per-call Vamana scratch (visit-mark table, RNG). DiskANN's RobustPrune
+	// allocates its candidate buffer inline today, so tls_.prune_scratch is
+	// unused on this side for now — Task 5 will use it when parallelizing
+	// the prune hot loop. Marked mutable because BeamSearch is const but
+	// bumps the epoch.
+	mutable vamana::VamanaTLS tls_;
 };
 
 } // namespace vindex

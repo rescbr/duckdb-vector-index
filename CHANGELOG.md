@@ -7,6 +7,80 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added — Phase 9: parallel AiSAQ CREATE INDEX
+
+- **Parallel PQ encoding** (Pass 1) — `EncodePqCodes` now runs across
+  `TaskScheduler::NumberOfThreads()` tasks via DuckDB's `TaskExecutor` push
+  API. Page-aligned row-range partitioning keeps `WritePqPage` and flat-
+  buffer writes disjoint across tasks. ~4.6× speedup on sift1m.
+- **Parallel graph construction** (Pass 2) — Vamana `Construct` runs across
+  N tasks with partitioned row ranges. Per-node spinlocks
+  (`NodeSpinlock`) on `AiSaqCore` handle `ConnectAndPrune`'s reciprocal
+  edges without a global rwlock, mirroring the hnswlib/DiskANN production
+  pattern. Peak CPU 957% on a 10-core host (~10/10 cores engaged). ~7×
+  speedup on sift1m Pass 2 vs serial.
+- **Parallel post-build phases** — `FinalizeInlineCodes`,
+  `ComputeLabelMedoids`, and `WriteAllGraphNodes` now run across N tasks
+  with disjoint partitions. `ComputeEntryPoints` stays serial (bounded by
+  `n_entry_points` ≤ 64). Also fixes a latent inefficiency: `ReadPqCode`
+  now has the flat `build_codes_` fast path (mirrors `DistanceToCode` /
+  `CopyBuildCode`), skipping `BufferManager::Pin` when the flat buffer is
+  active.
+- **Parallel quantizer training** — `PqQuantizer::Train` runs m=16
+  independent k-means++ passes in parallel via `std::thread` work-queue
+  with `hardware_concurrency()` cap. New `SetTrainThreads(n)` hint on the
+  `Quantizer` base class; `AiSaqIndex::TrainQuantizer` sets it from
+  `TaskScheduler::NumberOfThreads()`. ~4.9× speedup on sift1m (5.9s → 1.2s).
+- **Precomputed cross-distance table** on `PqQuantizer` — the symmetric
+  K×K centroid-pair distance table is built once at end of `Train()` /
+  `Deserialize()`. `CodeDistance` becomes O(m) array lookups instead of
+  O(m·sub_dim) simsimd FLOPs. For SIFT (m=16, K=256): 4MB table, ~5-10×
+  faster per call. 22% Pass 2 wall-clock improvement on sift1m.
+- **`VamanaTLS` per-thread scratch** — `visit_marks`, `visit_counter`,
+  `prune_scratch`, and `rng` extracted from `AiSaqCore` and `DiskAnnCore`
+  into a shared `src/include/vindex/vamana.hpp` struct. Pays down the
+  `TODO(M6)` at `aisaq_core.hpp:29-31`. Threaded as a parameter through
+  `BeamSearch` / `RobustPrune` / `ConnectAndPrune` build-path overloads.
+- **Thread-safe `AiSaqBlockStore`** — `graph_node_count_` and
+  `flat_build_mode_` are now `std::atomic`. `EnsureGraphCapacity(N)` is
+  pre-called once in `Finalize` before parallel tasks spawn.
+- **Phase timing instrumentation** — `train_quantizer`, `PQ encoding`,
+  and `pass2_construct` wall-clock times logged at `vindex_log_level=info`.
+- **New test** — `test/unit/test_vamana_concurrency.cpp` (3 cases: recall
+  match vs serial, graph invariants, multi-thread stress). Existing tests
+  verify byte-identical PQ codes, post-build state, and recall vs serial
+  baselines.
+
+### Changed
+
+- `AiSaqCore::Insert` path split: serial `Insert` (live inserts) delegates
+  to `InsertBuild` with the core's own `tls_`; parallel `InsertBuildRange`
+  passes per-task `VamanaTLS` + per-task label maps that merge serially in
+  `FinalizeParallelConstruct`.
+- `AiSaqCore::ConnectAndPrune` writes forward edges immediately and acquires
+  per-target `NodeSpinlock` for reciprocal edges. No global rwlock during
+  parallel construction; rwlock only in the serial `FinalizeParallelConstruct`
+  merge step.
+- `AiSaqCore::BeamSearch` / `RobustPrune` / `ConnectAndPrune` build-path
+  overloads take `VamanaTLS&` parameter; search-path stays single-threaded
+  via the core's `tls_` member.
+
+### Performance
+
+End-to-end `CREATE INDEX ... USING AISAQ` on sift1m (1M × 128-d,
+`pq_buffer` strategy, 10-core host):
+
+| Phase | Before | After | Speedup |
+|---|---|---|---|
+| Quantizer training | 5.9s | 1.2s | 4.9× |
+| PQ encode | 3.3s | 0.7s | 4.6× |
+| Graph construct | ~140s | ~20s | 7× |
+| Post-build | 2.8s | <0.1s | 28×+ |
+| **Total** | **~152s** | **~22s** | **6.9×** |
+
+Recall unchanged across all configurations: `aiasaq-pq` 0.9990,
+`aiasaq-scann` 0.9960, `aisaq-pq-inline64` 0.9990 (siftsmall thresholds).
+
 ## [0.2.0] - 2026-06-18
 
 Second tagged release. Built against DuckDB v1.5.3. Adds the AiSAQ

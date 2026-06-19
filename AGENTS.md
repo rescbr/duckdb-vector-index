@@ -248,6 +248,39 @@ Blocks are lazily allocated in `WriteAllGraphNodes`.
 `aisaq_l_build` defaults to `aisaq_r` (the Vamana paper recommendation).
 This decouples build beam width from search beam width.
 
+### AiSAQ parallel build (Phase 9)
+
+CREATE INDEX for AiSAQ is parallelized across `TaskScheduler::NumberOfThreads()`
+threads. The pipeline has four parallel phases, each using DuckDB's
+`TaskExecutor` push API or `std::thread`:
+
+1. **Quantizer training** — `PqQuantizer::Train` runs m=16 k-means++ passes
+   in parallel via `std::thread` work-queue (set by `SetTrainThreads`).
+2. **PQ encoding** (Pass 1) — `EncodePqCodes` partitions by page-aligned
+   row range; each task writes disjoint PQ pages + flat-buffer slots.
+3. **Graph construction** (Pass 2) — `InsertBuildRange` partitions rows
+   into contiguous ranges. `ConnectAndPrune` uses **per-node spinlocks**
+   (`NodeSpinlock` array on `AiSaqCore`, sized via `ResizeNodeLocks`)
+   for reciprocal edges — no global rwlock during construction. The
+   `VamanaTLS&` parameter on `BeamSearch`/`RobustPrune`/`ConnectAndPrune`
+   provides per-thread scratch (visit marks, RNG, prune buffer).
+4. **Post-build** — `FinalizeInlineCodes`, `ComputeLabelMedoids`,
+   `WriteAllGraphNodes` each partition by disjoint id/label/block range.
+
+Thread-safety invariants:
+- `AiSaqBlockStore::graph_node_count_` and `flat_build_mode_` are
+  `std::atomic`. `EnsureGraphCapacity(N)` is pre-called once before
+  parallel tasks spawn.
+- `PinGraphNode` / `PinPqPage` are const and safe for concurrent readers
+  (DuckDB's `BufferManager::Pin` is itself thread-safe).
+- Per-task label maps merge serially in `FinalizeParallelConstruct`.
+- The global `rwlock` is NOT taken during parallel construction; only
+  in the serial merge/finalize step.
+
+`PqQuantizer::cross_distance_table_` (m × K × K floats, 4MB for SIFT)
+precomputes centroid-pair distances at end of `Train()` / `Deserialize()`.
+`CodeDistance` uses O(m) lookups instead of O(m·sub_dim) simsimd FLOPs.
+
 ### AiSAQ label filtering
 
 `WITH (label_column='cat')` designates a BIGINT column for predicate

@@ -73,10 +73,16 @@ void AiSaqBlockStore::EnsureGraphCapacity(uint32_t up_to_internal_id) {
 }
 
 uint32_t AiSaqBlockStore::AllocGraphNode() {
-	if (!flat_build_mode_) {
-		EnsureGraphCapacity(graph_node_count_);
+	// fetch_add(1) returns the prior value and bumps by 1 — identical to the
+	// old `graph_node_count_++` return semantics, but safe under concurrent
+	// callers (Phase 9 Task 4). relaxed ordering is sufficient: the caller
+	// synchronises on the returned disjoint internal_id, not on the counter.
+	if (flat_build_mode_.load(std::memory_order_relaxed)) {
+		return graph_node_count_.fetch_add(1, std::memory_order_relaxed);
 	}
-	return graph_node_count_++;
+	const uint32_t id = graph_node_count_.fetch_add(1, std::memory_order_relaxed);
+	EnsureGraphCapacity(id);
+	return id;
 }
 
 void AiSaqBlockStore::WriteAllGraphNodesRange(const uint8_t *flat, idx_t count, idx_t block_start, idx_t block_end) {
@@ -119,7 +125,7 @@ void AiSaqBlockStore::WriteAllGraphNodes(const uint8_t *flat, idx_t count) {
 }
 
 BufferHandle AiSaqBlockStore::PinGraphNode(uint32_t internal_id) const {
-	D_ASSERT(internal_id < graph_node_count_);
+	D_ASSERT(internal_id < graph_node_count_.load(std::memory_order_relaxed));
 	const idx_t block_idx = internal_id / static_cast<uint32_t>(nodes_per_block_);
 	D_ASSERT(block_idx < graph_block_handles_.size());
 	auto handle = graph_block_handles_[block_idx];
@@ -214,7 +220,7 @@ void AiSaqBlockStore::ConvertToPersistent(QueryContext context) {
 
 void AiSaqBlockStore::SerializeState(vector<data_t> &out) const {
 	AppendPacked<uint64_t>(out, static_cast<uint64_t>(node_size_));
-	AppendPacked<uint64_t>(out, static_cast<uint64_t>(graph_node_count_));
+	AppendPacked<uint64_t>(out, static_cast<uint64_t>(graph_node_count_.load(std::memory_order_relaxed)));
 	AppendPacked<uint64_t>(out, static_cast<uint64_t>(graph_block_ids_.size()));
 	for (block_id_t bid : graph_block_ids_) {
 		AppendPacked<int64_t>(out, static_cast<int64_t>(bid));

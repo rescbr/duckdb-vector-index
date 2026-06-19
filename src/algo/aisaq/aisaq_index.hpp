@@ -87,6 +87,17 @@ class AiSaqIndex : public VectorIndex {
 	// Resolve build strategy (paged/pq_buffer/exact_prune) based on
 	// dataset size, available memory, and user options. Called from Finalize.
 	void ResolveBuildStrategy(ClientContext &context, idx_t N);
+	// Pre-size the block store's graph block vectors to hold N nodes, so that
+	// the per-node EnsureGraphCapacity call inside AllocGraphNode is a no-op
+	// during the parallel construct pass (Phase 9 Task 4). Must be called once,
+	// single-threaded, after Pass 1 knows N and before any construct task
+	// spawns. Safe to call in flat-build mode too (it just pre-sizes vectors
+	// that flat mode skips touching during AllocGraphNode).
+	void PreAllocateGraphCapacity(idx_t N) {
+		if (block_store_) {
+			block_store_->EnsureGraphCapacity(static_cast<uint32_t>(N));
+		}
+	}
 	// Populate flat PQ codes + full-precision vectors during EncodePqCodes.
 	// Activate the buffers on the core.
 	void ActivateBuildBuffers();

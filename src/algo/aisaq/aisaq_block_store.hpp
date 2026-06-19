@@ -1,5 +1,6 @@
 #pragma once
 
+#include "duckdb/common/atomic.hpp"
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -33,11 +34,15 @@ class AiSaqBlockStore {
 	// Must be called before AllocGraphNode. Computes nodes_per_block_.
 
 	uint32_t AllocGraphNode();
-	// Allocates a new internal_id. When flat_build_mode_ is set, skips
+	// Allocates a new internal_id via an atomic fetch_add — safe to call
+	// concurrently from multiple tasks. When flat_build_mode_ is set, skips
 	// EnsureGraphCapacity (blocks allocated lazily in WriteAllGraphNodes).
+	// In paged mode, EnsureGraphCapacity(id) is still invoked per-call, but a
+	// prior PreAllocateGraphCapacity/EnsureGraphCapacity(N) call sizes the
+	// block vectors once so the per-call path is a no-op (vector reads only).
 
 	void SetFlatBuildMode(bool enabled) {
-		flat_build_mode_ = enabled;
+		flat_build_mode_.store(enabled, std::memory_order_relaxed);
 	}
 
 	void EnsureGraphCapacity(uint32_t up_to_internal_id);
@@ -79,7 +84,7 @@ class AiSaqBlockStore {
 	// --- Introspection ---
 
 	idx_t GraphNodeCount() const {
-		return graph_node_count_;
+		return graph_node_count_.load(std::memory_order_relaxed);
 	}
 	idx_t GraphBlockCount() const {
 		return graph_block_handles_.size();
@@ -132,10 +137,10 @@ class AiSaqBlockStore {
 	// Graph nodes
 	idx_t node_size_ = 0;
 	idx_t nodes_per_block_ = 0;
-	uint32_t graph_node_count_ = 0;
+	atomic<uint32_t> graph_node_count_{0};
 	vector<shared_ptr<BlockHandle>> graph_block_handles_;
 	vector<block_id_t> graph_block_ids_;
-	bool flat_build_mode_ = false;
+	atomic<bool> flat_build_mode_{false};
 
 	// PQ code pages
 	idx_t code_size_ = 0;

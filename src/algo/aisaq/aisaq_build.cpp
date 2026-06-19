@@ -316,6 +316,12 @@ SinkFinalizeType PhysicalCreateAiSaqIndex::Finalize(Pipeline &pipeline, Event &e
 		        (unsigned long long)gstate.pq_encoded_count.load());
 	}
 
+	// Pre-size the graph block vectors once, single-threaded, so the
+	// per-node EnsureGraphCapacity inside AllocGraphNode is a no-op during
+	// Pass 2 (and any future parallel construct). This removes the
+	// lazy-block-allocation race in paged mode (Phase 9 Task 4).
+	gstate.global_index->PreAllocateGraphCapacity(collection->Count());
+
 	// Activate flat buffers on the core (zero-op for Tier 1).
 	gstate.global_index->ActivateBuildBuffers();
 

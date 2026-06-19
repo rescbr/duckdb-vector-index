@@ -851,3 +851,76 @@ TEST_CASE("Parallel post-build phases produce byte-identical state to serial", "
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 9 Task 4: concurrent AllocGraphNode stress test.
+//
+// AllocGraphNode must hand out disjoint internal_ids with no duplicates and no
+// lost increments under concurrent callers — the atomic fetch_add is the only
+// mechanism keeping the internal_id ↔ PQ-slot mapping intact once Task 5
+// parallelises Pass 2. We test both the flat-build path (no EnsureGraphCapacity)
+// and the paged path (pre-allocated so EnsureGraphCapacity is a no-op), since
+// both branches go through the same fetch_add.
+// ---------------------------------------------------------------------------
+TEST_CASE("Concurrent AllocGraphNode hands out disjoint ids", "[aisaq_alloc_concurrent][unit]") {
+	MemoryDB mem;
+
+	constexpr idx_t PER_THREAD = 1000;
+	constexpr idx_t NUM_THREADS = 8;
+	constexpr idx_t EXPECTED_TOTAL = PER_THREAD * NUM_THREADS;
+
+	auto run_case = [&](bool flat_mode) {
+		AiSaqBlockStore store(*mem.bm, *mem.bufmgr);
+		// node_size must be a multiple of 8 (alignment invariant) and divide
+		// the block size evenly. 64 is a safe small node size.
+		constexpr idx_t NODE_SIZE = 64;
+		store.RegisterGraphLayout(NODE_SIZE);
+		// Pre-allocate capacity for all nodes once, single-threaded, mirroring
+		// the Finalize pre-call (Phase 9 Task 4). In paged mode this makes the
+		// per-call EnsureGraphCapacity inside AllocGraphNode a no-op.
+		if (!flat_mode) {
+			store.EnsureGraphCapacity(static_cast<uint32_t>(EXPECTED_TOTAL));
+		}
+		store.SetFlatBuildMode(flat_mode);
+
+		std::vector<std::vector<uint32_t>> per_thread_ids(NUM_THREADS);
+
+		std::vector<std::thread> workers;
+		workers.reserve(NUM_THREADS);
+		for (idx_t t = 0; t < NUM_THREADS; t++) {
+			workers.emplace_back([&store, &per_thread_ids, t]() {
+				per_thread_ids[t].reserve(PER_THREAD);
+				for (idx_t i = 0; i < PER_THREAD; i++) {
+					per_thread_ids[t].push_back(store.AllocGraphNode());
+				}
+			});
+		}
+		for (auto &w : workers) {
+			w.join();
+		}
+
+		// (1) Total count is exactly right (no lost increments).
+		REQUIRE(store.GraphNodeCount() == EXPECTED_TOTAL);
+
+		// (2) No duplicates and no out-of-range ids across all threads.
+		std::unordered_set<uint32_t> seen;
+		seen.reserve(EXPECTED_TOTAL);
+		idx_t collected = 0;
+		for (const auto &ids : per_thread_ids) {
+			REQUIRE(ids.size() == PER_THREAD);
+			for (uint32_t id : ids) {
+				REQUIRE(id < EXPECTED_TOTAL);
+				REQUIRE(seen.insert(id).second); // insert().second == true iff newly inserted
+			}
+			collected += ids.size();
+		}
+		REQUIRE(collected == EXPECTED_TOTAL);
+	};
+
+	SECTION("flat build mode") {
+		run_case(true);
+	}
+	SECTION("paged mode (pre-allocated)") {
+		run_case(false);
+	}
+}

@@ -1,8 +1,12 @@
 #include "algo/aisaq/aisaq_core.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/parallel/task_executor.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <queue>
@@ -38,6 +42,52 @@ struct WorkingCmp {
 	}
 };
 
+// Per-task workers for the parallel post-build phases (Phase 9 Task 3).
+// Mirror the AiSaqPqEncodeTask pattern: subclass BaseExecutorTask, hold
+// references to the core + the partition range, invoke the *_Range worker.
+class AiSaqFinalizeInlineTask final : public BaseExecutorTask {
+  public:
+	AiSaqFinalizeInlineTask(TaskExecutor &executor, const AiSaqCore &core, idx_t id_start, idx_t id_end)
+	    : BaseExecutorTask(executor), core_(core), id_start_(id_start), id_end_(id_end) {
+	}
+
+	void ExecuteTask() override {
+		core_.FinalizeInlineCodesRange(id_start_, id_end_);
+	}
+
+	string TaskType() const override {
+		return "AiSaqFinalizeInlineTask";
+	}
+
+  private:
+	const AiSaqCore &core_;
+	idx_t id_start_;
+	idx_t id_end_;
+};
+
+class AiSaqComputeMedoidsTask final : public BaseExecutorTask {
+  public:
+	AiSaqComputeMedoidsTask(TaskExecutor &executor, const AiSaqCore &core, const vector<int64_t> &labels, idx_t start,
+	                        idx_t end, unordered_map<int64_t, uint32_t> &local_out)
+	    : BaseExecutorTask(executor), core_(core), labels_(labels), start_(start), end_(end), local_out_(local_out) {
+	}
+
+	void ExecuteTask() override {
+		core_.ComputeLabelMedoidsRange(labels_, start_, end_, local_out_);
+	}
+
+	string TaskType() const override {
+		return "AiSaqComputeMedoidsTask";
+	}
+
+  private:
+	const AiSaqCore &core_;
+	const vector<int64_t> &labels_;
+	idx_t start_;
+	idx_t end_;
+	unordered_map<int64_t, uint32_t> &local_out_;
+};
+
 } // namespace
 
 AiSaqCore::AiSaqCore(AiSaqCoreParams params, Quantizer &quantizer, AiSaqBlockStore &store)
@@ -67,6 +117,14 @@ idx_t AiSaqCore::StaticNodeSize() const {
 }
 
 AiSaqCore::PqCodeRef AiSaqCore::ReadPqCode(uint32_t internal_id) const {
+	// Tier 2/3 fast path: when the flat build_codes_ buffer is active, skip
+	// BufferManager entirely. The bytes are identical to what PinPqPage would
+	// return (Pass 1 wrote both buffers from the same encoder). This is the
+	// same shortcut DistanceToCode / CopyBuildCode already take; without it,
+	// parallel post-build phases serialise on BufferManager::Pin's pool mutex.
+	if (build_codes_) {
+		return {BufferHandle(), build_codes_ + idx_t(internal_id) * code_size_};
+	}
 	const idx_t codes_per_page = store_.CodesPerPage();
 	const uint32_t page_idx = internal_id / static_cast<uint32_t>(codes_per_page);
 	const idx_t offset = (idx_t(internal_id) % codes_per_page) * code_size_;
@@ -96,8 +154,8 @@ uint32_t AiSaqCore::PickEntryPoint(const float *query_lut) const {
 // ---------------------------------------------------------------------------
 
 vector<AiSaqCore::Candidate> AiSaqCore::BeamSearch(const float *query_lut, idx_t L, idx_t io_limit,
-                                                    const vector<uint32_t> *forced_entry_points,
-                                                    const LabelFilter *label_filter) const {
+                                                   const vector<uint32_t> *forced_entry_points,
+                                                   const LabelFilter *label_filter) const {
 	vector<Candidate> out;
 	if (size_ == 0 || L == 0) {
 		return out;
@@ -132,8 +190,7 @@ vector<AiSaqCore::Candidate> AiSaqCore::BeamSearch(const float *query_lut, idx_t
 	} else {
 		const uint32_t entry_internal = PickEntryPoint(query_lut);
 		if (entry_internal >= tls_.visit_marks.size()) {
-			tls_.visit_marks.resize(
-			    std::max<size_t>(tls_.visit_marks.size() * 2, size_t(entry_internal) + 1), 0);
+			tls_.visit_marks.resize(std::max<size_t>(tls_.visit_marks.size() * 2, size_t(entry_internal) + 1), 0);
 		}
 		tls_.visit_marks[entry_internal] = vc;
 		io_count++;
@@ -283,7 +340,7 @@ vector<AiSaqCore::Candidate> AiSaqCore::RobustPrune(const float * /*query_lut*/,
 			float d_pp;
 			if (need_gather) {
 				d_pp = quantizer_.CodeDistance(tls_.prune_scratch.data() + p_idx * code_size_,
-				                                tls_.prune_scratch.data() + pp_idx * code_size_);
+				                               tls_.prune_scratch.data() + pp_idx * code_size_);
 			} else {
 				d_pp = CodeDistance(uint32_t(candidates[p_idx].row_id), uint32_t(candidates[pp_idx].row_id));
 			}
@@ -340,8 +397,7 @@ void AiSaqCore::ConnectAndPrune(uint32_t new_internal_id, const float *new_lut, 
 		cand.reserve(idx_t(cnt) + 1);
 		if (need_gather) {
 			const_data_ptr_t s_ptr = local_codes.data();
-			cand.push_back({int64_t(new_internal_id),
-			                quantizer_.CodeDistance(s_ptr, local_codes.data() + code_size_)});
+			cand.push_back({int64_t(new_internal_id), quantizer_.CodeDistance(s_ptr, local_codes.data() + code_size_)});
 			for (uint16_t i = 0; i < cnt; i++) {
 				cand.push_back({int64_t(GetNeighbor(sref.ptr, i)),
 				                quantizer_.CodeDistance(s_ptr, local_codes.data() + idx_t(i + 2) * code_size_)});
@@ -421,13 +477,10 @@ uint32_t AiSaqCore::Insert(int64_t row_id, const float *vec, int64_t label) {
 // FinalizeInlineCodes
 // ---------------------------------------------------------------------------
 
-void AiSaqCore::FinalizeInlineCodes() {
-	if (params_.inline_pq_count == 0 || size_ == 0) {
-		return;
-	}
+void AiSaqCore::FinalizeInlineCodesRange(idx_t id_start, idx_t id_end) const {
 	const idx_t inline_region_off = kNeighborArrayOffset + idx_t(params_.R) * sizeof(uint32_t);
-	for (uint32_t id = 0; id < size_; id++) {
-		auto nref = PinNode(id);
+	for (idx_t id = id_start; id < id_end; id++) {
+		auto nref = PinNode(uint32_t(id));
 		const uint16_t n = GetNeighborCount(nref.ptr);
 		const uint16_t nin = std::min<uint16_t>(n, params_.inline_pq_count);
 		for (uint16_t i = 0; i < nin; i++) {
@@ -438,8 +491,37 @@ void AiSaqCore::FinalizeInlineCodes() {
 	}
 }
 
+void AiSaqCore::FinalizeInlineCodes() {
+	if (params_.inline_pq_count == 0 || size_ == 0) {
+		return;
+	}
+	// Serial fallback for unit tests without a DatabaseInstance.
+	if (db_ == nullptr) {
+		FinalizeInlineCodesRange(0, size_);
+		return;
+	}
+	auto &scheduler = TaskScheduler::GetScheduler(*db_);
+	const size_t num_threads = std::max<size_t>(1, NumericCast<size_t>(scheduler.NumberOfThreads()));
+	TaskExecutor executor(scheduler);
+	for (size_t t = 0; t < num_threads; t++) {
+		const idx_t id_start = idx_t(t) * size_ / num_threads;
+		const idx_t id_end = idx_t(t + 1) * size_ / num_threads;
+		if (id_start >= id_end) {
+			continue;
+		}
+		executor.ScheduleTask(make_uniq<AiSaqFinalizeInlineTask>(executor, *this, id_start, id_end));
+	}
+	executor.WorkOnTasks();
+}
+
 // ---------------------------------------------------------------------------
 // ComputeEntryPoints
+//
+// Stays serial: at most params_.n_entry_points (≤16 by default, ≤64 max)
+// iterations of a single ReadPqCode Pin + small code copy. The TaskExecutor
+// scheduling overhead (~tens of µs per task) exceeds the work even at the
+// upper bound. entry_points_ is pre-sized so per-iteration indexed writes
+// are concurrency-safe regardless of caller threading model.
 // ---------------------------------------------------------------------------
 
 void AiSaqCore::ComputeEntryPoints() {
@@ -448,14 +530,13 @@ void AiSaqCore::ComputeEntryPoints() {
 		return;
 	}
 	const uint16_t want = std::min<uint32_t>(params_.n_entry_points, size_);
+	entry_points_.resize(want);
 	for (uint16_t i = 0; i < want; i++) {
 		// Evenly-spaced internal_ids across the dataset.
 		const uint32_t id = (uint32_t(i) * uint32_t(size_)) / uint32_t(want);
 		auto ref = ReadPqCode(id);
-		EntryPoint ep;
-		ep.internal_id = id;
-		ep.code.assign(ref.ptr, ref.ptr + code_size_);
-		entry_points_.push_back(std::move(ep));
+		entry_points_[i].internal_id = id;
+		entry_points_[i].code.assign(ref.ptr, ref.ptr + code_size_);
 	}
 }
 
@@ -463,29 +544,20 @@ void AiSaqCore::ComputeEntryPoints() {
 // ComputeLabelMedoids
 // ---------------------------------------------------------------------------
 
-void AiSaqCore::ComputeLabelMedoids() {
-	if (label_to_internal_ids_.empty()) {
-		return;
-	}
-
-	// Build sorted_labels_ for range queries.
-	sorted_labels_.clear();
-	sorted_labels_.reserve(label_to_internal_ids_.size());
-	for (const auto &kv : label_to_internal_ids_) {
-		sorted_labels_.push_back(kv.first);
-	}
-	std::sort(sorted_labels_.begin(), sorted_labels_.end());
-
-	// For each label, find the medoid: the member whose PQ code is closest
-	// to the label's centroid (approximated by averaging member codes).
-	label_medoids_.clear();
-	for (const auto &kv : label_to_internal_ids_) {
-		const auto &members = kv.second;
+void AiSaqCore::ComputeLabelMedoidsRange(const vector<int64_t> &labels, idx_t start, idx_t end,
+                                         unordered_map<int64_t, uint32_t> &local_out) const {
+	for (idx_t li = start; li < end; li++) {
+		const int64_t label = labels[li];
+		auto it = label_to_internal_ids_.find(label);
+		if (it == label_to_internal_ids_.end()) {
+			continue;
+		}
+		const auto &members = it->second;
 		if (members.empty()) {
 			continue;
 		}
 		if (members.size() == 1) {
-			label_medoids_[kv.first] = members[0];
+			local_out[label] = members[0];
 			continue;
 		}
 
@@ -517,7 +589,62 @@ void AiSaqCore::ComputeLabelMedoids() {
 				best_id = mid;
 			}
 		}
-		label_medoids_[kv.first] = best_id;
+		local_out[label] = best_id;
+	}
+}
+
+void AiSaqCore::ComputeLabelMedoids() {
+	if (label_to_internal_ids_.empty()) {
+		return;
+	}
+
+	// Build sorted_labels_ for range queries (serial — small relative to the
+	// per-label work below, and the sort needs to happen anyway).
+	sorted_labels_.clear();
+	sorted_labels_.reserve(label_to_internal_ids_.size());
+	for (const auto &kv : label_to_internal_ids_) {
+		sorted_labels_.push_back(kv.first);
+	}
+	std::sort(sorted_labels_.begin(), sorted_labels_.end());
+
+	label_medoids_.clear();
+	label_medoids_.reserve(sorted_labels_.size());
+
+	// Serial fallback for unit tests without a DatabaseInstance, or when the
+	// label count is too small to amortise TaskExecutor scheduling overhead.
+	const size_t num_labels = sorted_labels_.size();
+	const bool serial = db_ == nullptr || num_labels < 8;
+	if (serial) {
+		ComputeLabelMedoidsRange(sorted_labels_, 0, num_labels, label_medoids_);
+		return;
+	}
+
+	auto &scheduler = TaskScheduler::GetScheduler(*db_);
+	const size_t num_threads = std::max<size_t>(1, NumericCast<size_t>(scheduler.NumberOfThreads()));
+	const size_t actual_threads = std::min(num_threads, num_labels);
+
+	// Per-task local maps avoid concurrent unordered_map writes (which would
+	// race on rehashing). Merged into label_medoids_ serially after all tasks
+	// complete.
+	vector<unordered_map<int64_t, uint32_t>> locals(actual_threads);
+	TaskExecutor executor(scheduler);
+	for (size_t t = 0; t < actual_threads; t++) {
+		const idx_t start = idx_t(t) * num_labels / actual_threads;
+		const idx_t end = idx_t(t + 1) * num_labels / actual_threads;
+		if (start >= end) {
+			continue;
+		}
+		executor.ScheduleTask(
+		    make_uniq<AiSaqComputeMedoidsTask>(executor, *this, sorted_labels_, start, end, locals[t]));
+	}
+	executor.WorkOnTasks();
+
+	// Serial merge — bucket positions are stable (label_medoids_ was reserved
+	// above so no rehash occurs during insertion).
+	for (auto &local : locals) {
+		for (auto &kv : local) {
+			label_medoids_[kv.first] = kv.second;
+		}
 	}
 }
 

@@ -45,7 +45,7 @@ class AiSaqIndex : public VectorIndex {
 	}
 
 	unique_ptr<IndexScanState> InitializeScan(float *query_vector, idx_t limit, ClientContext &context,
-	                                           const LabelFilter &label_filter) override;
+	                                          const LabelFilter &label_filter) override;
 	idx_t Scan(IndexScanState &state, Vector &result, idx_t result_offset = 0) override;
 
 	unique_ptr<IndexScanState> InitializeMultiScan(ClientContext &context) override;

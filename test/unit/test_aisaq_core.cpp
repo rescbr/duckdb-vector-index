@@ -732,3 +732,122 @@ TEST_CASE("Parallel PQ encoding produces byte-identical pages to serial", "[aisa
 		REQUIRE(std::memcmp(serial_handle.Ptr(), parallel_handle.Ptr(), codes_per_page * code_size) == 0);
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase 9 Task 3: parallel post-build phases byte-identity test.
+//
+// FinalizeInlineCodes / ComputeEntryPoints / ComputeLabelMedoids all iterate
+// over disjoint items with no cross-item mutation. Their outputs (inline PQ
+// regions in graph nodes, entry_points_ vector, label_medoids_ map) must be
+// bit-identical whether the methods run serially (SetDatabase(nullptr)) or
+// via TaskScheduler (SetDatabase(&instance)).
+//
+// Strategy: build two AiSaqCores with identical data + labels, run the three
+// post-build phases serially on one and parallelly on the other, then:
+//   1. Compare the inline PQ region of every graph node (FinalizeInlineCodes).
+//   2. Compare SerializeState byte-for-byte — covers entry_points_ and
+//      label_medoids_. The unordered_map iteration order is deterministic
+//      here because both cores see the same Insert sequence (so
+//      label_to_internal_ids_ has the same bucket layout), and lookups into
+//      label_medoids_ via .at() are order-independent.
+//   3. Cross-check via Search — if entry_points_ or label_medoids_ diverge,
+//      search results with label filters would diverge too.
+// ---------------------------------------------------------------------------
+TEST_CASE("Parallel post-build phases produce byte-identical state to serial", "[aisaq_postbuild_parallel][unit]") {
+	MemoryDB mem;
+
+	constexpr idx_t N = 2000;
+	constexpr idx_t D = 16;
+	constexpr uint8_t M = 4;
+	constexpr uint8_t BITS = 8;
+
+	auto data = RandomGaussian(N, D, 0x9A77u);
+	// 8 well-separated clusters with offsets so label medoids are unambiguous.
+	for (idx_t i = 0; i < N; i++) {
+		const int64_t label = int64_t(i / (N / 8)) + 1; // 8 labels
+		const float offset = float(label) * 1000.0f;
+		for (idx_t j = 0; j < D; j++) {
+			data[i * D + j] += offset;
+		}
+	}
+
+	PqQuantizer quant(MetricKind::L2SQ, D, M, BITS, 42);
+	quant.Train(data.data(), N, D);
+
+	auto build_core = [&](AiSaqBlockStore &store, duckdb::DatabaseInstance *db) -> std::unique_ptr<AiSaqCore> {
+		AiSaqCoreParams params;
+		params.dim = D;
+		params.R = 16;
+		params.L = 64;
+		params.inline_pq_count = 16; // exercise FinalizeInlineCodes
+		params.n_entry_points = 16;  // bounded but non-trivial
+		params.seed = 7;
+
+		auto core = std::make_unique<AiSaqCore>(params, quant, store);
+		core->SetDatabase(db);
+		WriteAllPqCodes(store, quant, data.data(), N, D);
+		for (idx_t i = 0; i < N; i++) {
+			const int64_t label = int64_t(i / (N / 8)) + 1;
+			core->Insert(int64_t(i), data.data() + i * D, label);
+		}
+		REQUIRE(core->Size() == N);
+		return core;
+	};
+
+	// --- Serial baseline ---
+	AiSaqBlockStore serial_store(*mem.bm, *mem.bufmgr);
+	auto serial_core = build_core(serial_store, nullptr);
+	serial_core->FinalizeInlineCodes();
+	serial_core->ComputeEntryPoints();
+	serial_core->ComputeLabelMedoids();
+
+	// --- Parallel ---
+	AiSaqBlockStore parallel_store(*mem.bm, *mem.bufmgr);
+	auto parallel_core = build_core(parallel_store, mem.db.instance.get());
+	parallel_core->FinalizeInlineCodes();
+	parallel_core->ComputeEntryPoints();
+	parallel_core->ComputeLabelMedoids();
+
+	// (1) Inline PQ bytes per node — compare the inline region of each node.
+	// Layout: [16-byte header][R * 4 bytes neighbors][inline_pq_count * code_size bytes]
+	const idx_t R = serial_core->Params().R;
+	const idx_t inline_pq_count = serial_core->Params().inline_pq_count;
+	const idx_t code_size = quant.CodeSize();
+	const idx_t inline_off = 16 + R * sizeof(uint32_t);
+	const idx_t inline_bytes = inline_pq_count * code_size;
+	REQUIRE(parallel_core->Params().R == R);
+	REQUIRE(parallel_core->Params().inline_pq_count == inline_pq_count);
+	for (uint32_t id = 0; id < N; id++) {
+		auto s_handle = serial_store.PinGraphNode(id);
+		auto p_handle = parallel_store.PinGraphNode(id);
+		const idx_t off_in_block = (id % serial_store.NodesPerBlock()) * serial_store.NodeSize();
+		REQUIRE(std::memcmp(s_handle.Ptr() + off_in_block + inline_off, p_handle.Ptr() + off_in_block + inline_off,
+		                    inline_bytes) == 0);
+	}
+
+	// (2) SerializeState byte-for-byte — covers entry_points_ + label_medoids_.
+	duckdb::vector<duckdb::data_t> serial_blob;
+	duckdb::vector<duckdb::data_t> parallel_blob;
+	serial_core->SerializeState(serial_blob);
+	parallel_core->SerializeState(parallel_blob);
+	REQUIRE(serial_blob.size() == parallel_blob.size());
+	REQUIRE(std::memcmp(serial_blob.data(), parallel_blob.data(), serial_blob.size()) == 0);
+
+	// (3) Cross-check via Search: label-filtered queries must produce identical
+	// results — divergence here would indicate entry_points_ or label_medoids_
+	// drift (the only label-dependent search inputs).
+	for (int64_t label = 1; label <= 8; label++) {
+		std::vector<float> query(D, float(label) * 1000.0f); // query at cluster center
+		std::vector<float> qpre(quant.QueryWorkspaceSize());
+		quant.PreprocessQuery(query.data(), qpre.data());
+		std::vector<float> lut(quant.LUTSize());
+		quant.PopulateDistanceLUT(qpre.data(), lut.data());
+
+		auto s_res = serial_core->Search(lut.data(), 5, serial_core->Params().L, 8, 0, LabelFilter::Equals(label));
+		auto p_res = parallel_core->Search(lut.data(), 5, parallel_core->Params().L, 8, 0, LabelFilter::Equals(label));
+		REQUIRE(s_res.size() == p_res.size());
+		for (idx_t i = 0; i < s_res.size(); i++) {
+			REQUIRE(s_res[i].row_id == p_res[i].row_id);
+		}
+	}
+}

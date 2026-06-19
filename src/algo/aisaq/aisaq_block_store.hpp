@@ -4,11 +4,12 @@
 #include "duckdb/common/vector.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/storage/block_manager.hpp"
-#include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/buffer/buffer_handle.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/storage_info.hpp"
 
 namespace duckdb {
+class DatabaseInstance;
 namespace vindex {
 namespace aisaq {
 
@@ -93,7 +94,21 @@ class AiSaqBlockStore {
 	// blocks. Called after construction when a flat node buffer was used.
 	// Creates the necessary blocks (lazily — skipped during construction
 	// when flat_build_mode_ is set) and copies the data sequentially.
+	// Parallelised across TaskScheduler::NumberOfThreads() tasks with
+	// disjoint block_idx ranges when SetDatabase has been called.
 	void WriteAllGraphNodes(const uint8_t *flat, idx_t count);
+
+	// Per-task worker: writes blocks [block_start, block_end) from the flat
+	// buffer. Public so the AiSaqWriteNodesTask defined in the .cpp can call
+	// it without a friend declaration.
+	void WriteAllGraphNodesRange(const uint8_t *flat, idx_t count, idx_t block_start, idx_t block_end);
+
+	// Inject the DatabaseInstance for parallel WriteAllGraphNodes. When null
+	// (default; used by unit tests without a full DuckDB instance), the write
+	// stays serial.
+	void SetDatabase(DatabaseInstance *db) {
+		db_ = db;
+	}
 
 	// Convert all transient blocks to persistent DuckDB blocks.
 	// Called at checkpoint (SerializeToDisk). After this call, all
@@ -109,6 +124,10 @@ class AiSaqBlockStore {
 
 	BlockManager &block_manager_;
 	BufferManager &buffer_manager_;
+
+	// Optional DatabaseInstance for parallel WriteAllGraphNodes. When null,
+	// writes stay serial (unit-test path).
+	DatabaseInstance *db_ = nullptr;
 
 	// Graph nodes
 	idx_t node_size_ = 0;

@@ -17,6 +17,7 @@
 #include <random>
 
 namespace duckdb {
+class DatabaseInstance;
 namespace vindex {
 namespace aisaq {
 
@@ -86,17 +87,33 @@ class AiSaqCore {
 	                         const LabelFilter &label_filter = LabelFilter::None()) const;
 
 	// Copy the PQ codes of the first `inline_pq_count` neighbors into each
-	// node's inline region. No-op when inline_pq_count == 0.
+	// node's inline region. No-op when inline_pq_count == 0. Parallelised
+	// across TaskScheduler::NumberOfThreads() tasks with disjoint id ranges
+	// when SetDatabase has been called; otherwise runs serially.
 	void FinalizeInlineCodes();
 
 	// Populate entry_points_ with up to n_entry_points spread-out nodes whose
 	// PQ codes are cached inline for the entry-point distance probe at search.
+	// Output is bit-identical to the serial path; the loop itself stays serial
+	// (bounded by n_entry_points ≤ 64 — TaskExecutor overhead exceeds the
+	// work) but entry_points_ is pre-sized so the per-iteration write is
+	// concurrency-safe regardless of caller threading.
 	void ComputeEntryPoints();
 
 	// Compute per-label medoids after all inserts. For each label, finds the
 	// member whose PQ code is closest to the label's centroid (approximated
 	// by averaging PQ codes). Also builds sorted_labels_ for range queries.
+	// Parallelised across disjoint label partitions with per-task local maps
+	// merged serially at the end (unordered_map concurrent writes are unsafe).
 	void ComputeLabelMedoids();
+
+	// Inject the DatabaseInstance used to spawn parallel post-build tasks.
+	// When unset (nullptr), FinalizeInlineCodes / ComputeLabelMedoids run
+	// serially — used by unit tests that build AiSaqCore without a full
+	// DatabaseInstance.
+	void SetDatabase(DatabaseInstance *db) {
+		db_ = db;
+	}
 
 	// Count labels in [lo, hi] via binary search on sorted_labels_.
 	idx_t CountLabelsInRange(int64_t lo, int64_t hi) const;
@@ -144,6 +161,21 @@ class AiSaqCore {
 	void PrepareForBuild(idx_t estimated_count) {
 		tls_.PrepareForBuild(estimated_count);
 	}
+
+	// Per-task workers for parallel post-build phases (Phase 9 Task 3).
+	// Public so the AiSaqFinalizeInlineTask / AiSaqComputeMedoidsTask classes
+	// defined in the .cpp can invoke them without friend declarations —
+	// mirrors the AiSaqIndex::EncodePqRange pattern from Task 2.
+	// FinalizeInlineCodesRange: processes nodes [id_start, id_end) — writes
+	// are disjoint across tasks because each task touches a distinct id range
+	// and only writes to its own nodes' inline regions.
+	void FinalizeInlineCodesRange(idx_t id_start, idx_t id_end) const;
+	// ComputeLabelMedoidsRange: processes labels [start, end) of `labels`,
+	// writing results into the caller-supplied local map (per-task). Reads
+	// from label_to_internal_ids_ are const; writes go to the disjoint local
+	// map. Merged into label_medoids_ serially after all tasks complete.
+	void ComputeLabelMedoidsRange(const vector<int64_t> &labels, idx_t start, idx_t end,
+	                              unordered_map<int64_t, uint32_t> &local_out) const;
 
 	idx_t Size() const {
 		return size_;
@@ -244,8 +276,7 @@ class AiSaqCore {
 			return RawDistance(build_vectors_ + idx_t(a) * params_.dim, build_vectors_ + idx_t(b) * params_.dim);
 		}
 		if (build_codes_) {
-			return quantizer_.CodeDistance(build_codes_ + idx_t(a) * code_size_,
-			                                build_codes_ + idx_t(b) * code_size_);
+			return quantizer_.CodeDistance(build_codes_ + idx_t(a) * code_size_, build_codes_ + idx_t(b) * code_size_);
 		}
 		auto ra = ReadPqCode(a);
 		auto rb = ReadPqCode(b);
@@ -320,6 +351,11 @@ class AiSaqCore {
 	// epoch and reuse the scratch. In Task 5 this is lifted to a per-thread
 	// parameter to make concurrent primitives safe by construction.
 	mutable vamana::VamanaTLS tls_;
+
+	// Database instance for TaskScheduler access. When null, the post-build
+	// phases fall back to the serial path (used by unit tests that don't
+	// stand up a full DuckDB instance).
+	DatabaseInstance *db_ = nullptr;
 };
 
 } // namespace aisaq

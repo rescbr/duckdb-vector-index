@@ -1,12 +1,45 @@
 #include "algo/aisaq/aisaq_block_store.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/parallel/task_executor.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace duckdb {
 namespace vindex {
 namespace aisaq {
+
+namespace {
+
+// Per-task worker for parallel WriteAllGraphNodes (Phase 9 Task 3 bonus).
+class AiSaqWriteNodesTask final : public BaseExecutorTask {
+  public:
+	AiSaqWriteNodesTask(TaskExecutor &executor, AiSaqBlockStore &store, const uint8_t *flat, idx_t count,
+	                    idx_t block_start, idx_t block_end)
+	    : BaseExecutorTask(executor), store_(store), flat_(flat), count_(count), block_start_(block_start),
+	      block_end_(block_end) {
+	}
+
+	void ExecuteTask() override {
+		store_.WriteAllGraphNodesRange(flat_, count_, block_start_, block_end_);
+	}
+
+	string TaskType() const override {
+		return "AiSaqWriteNodesTask";
+	}
+
+  private:
+	AiSaqBlockStore &store_;
+	const uint8_t *flat_;
+	idx_t count_;
+	idx_t block_start_;
+	idx_t block_end_;
+};
+
+} // namespace
 
 AiSaqBlockStore::AiSaqBlockStore(BlockManager &block_manager, BufferManager &buffer_manager)
     : block_manager_(block_manager), buffer_manager_(buffer_manager) {
@@ -46,12 +79,8 @@ uint32_t AiSaqBlockStore::AllocGraphNode() {
 	return graph_node_count_++;
 }
 
-void AiSaqBlockStore::WriteAllGraphNodes(const uint8_t *flat, idx_t count) {
-	// Lazily allocate blocks skipped during flat-build construction.
-	if (count > 0) {
-		EnsureGraphCapacity(static_cast<uint32_t>(count - 1));
-	}
-	for (idx_t block_idx = 0; block_idx * nodes_per_block_ < count; block_idx++) {
+void AiSaqBlockStore::WriteAllGraphNodesRange(const uint8_t *flat, idx_t count, idx_t block_start, idx_t block_end) {
+	for (idx_t block_idx = block_start; block_idx < block_end; block_idx++) {
 		D_ASSERT(block_idx < graph_block_handles_.size());
 		auto handle = buffer_manager_.Pin(graph_block_handles_[block_idx]);
 		const idx_t start_node = block_idx * nodes_per_block_;
@@ -59,6 +88,34 @@ void AiSaqBlockStore::WriteAllGraphNodes(const uint8_t *flat, idx_t count) {
 		const idx_t bytes = (end_node - start_node) * node_size_;
 		std::memcpy(handle.Ptr(), flat + start_node * node_size_, bytes);
 	}
+}
+
+void AiSaqBlockStore::WriteAllGraphNodes(const uint8_t *flat, idx_t count) {
+	// Lazily allocate blocks skipped during flat-build construction.
+	if (count > 0) {
+		EnsureGraphCapacity(static_cast<uint32_t>(count - 1));
+	}
+	// Serial fallback for unit tests without a DatabaseInstance, or when the
+	// block count is too small to amortise TaskExecutor scheduling overhead.
+	const idx_t total_blocks = (count + nodes_per_block_ - 1) / nodes_per_block_;
+	const bool serial = db_ == nullptr || total_blocks < 4;
+	if (serial) {
+		WriteAllGraphNodesRange(flat, count, 0, total_blocks);
+		return;
+	}
+	auto &scheduler = TaskScheduler::GetScheduler(*db_);
+	const size_t num_threads = std::max<size_t>(1, NumericCast<size_t>(scheduler.NumberOfThreads()));
+	const size_t actual_threads = std::min(num_threads, NumericCast<size_t>(total_blocks));
+	TaskExecutor executor(scheduler);
+	for (size_t t = 0; t < actual_threads; t++) {
+		const idx_t block_start = idx_t(t) * total_blocks / actual_threads;
+		const idx_t block_end = idx_t(t + 1) * total_blocks / actual_threads;
+		if (block_start >= block_end) {
+			continue;
+		}
+		executor.ScheduleTask(make_uniq<AiSaqWriteNodesTask>(executor, *this, flat, count, block_start, block_end));
+	}
+	executor.WorkOnTasks();
 }
 
 BufferHandle AiSaqBlockStore::PinGraphNode(uint32_t internal_id) const {

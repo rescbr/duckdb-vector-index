@@ -20,8 +20,8 @@
 #include "duckdb/parallel/task_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
-#include "duckdb/storage/storage_info.hpp"
 #include "duckdb/storage/partial_block_manager.hpp"
+#include "duckdb/storage/storage_info.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
 
 #include "algo/aisaq/aisaq_module.hpp"
@@ -305,9 +305,7 @@ void AiSaqIndex::ActivateBuildBuffers() {
 	// Tier 2+: allocate flat graph node buffer so PinNode skips BufferManager.
 	if (build_strategy_ != BuildStrategy::PAGED) {
 		const idx_t node_size = core_->StaticNodeSize();
-		const idx_t N = quantizer_->CodeSize() > 0
-		                    ? build_codes_buffer_.size() / quantizer_->CodeSize()
-		                    : 0;
+		const idx_t N = quantizer_->CodeSize() > 0 ? build_codes_buffer_.size() / quantizer_->CodeSize() : 0;
 		if (N > 0) {
 			build_nodes_buffer_.assign(N * node_size, 0);
 			core_->SetBuildNodes(build_nodes_buffer_.data());
@@ -364,6 +362,16 @@ AiSaqIndex::AiSaqIndex(const string &name, IndexConstraintType index_constraint_
 
 	const auto metric = ParseMetric(options);
 	InitFromOptions(options, vector_size, metric);
+
+	// Inject the DatabaseInstance so the core + block store can spawn
+	// parallel post-build tasks via TaskScheduler (Phase 9 Task 3). When null,
+	// the post-build phases fall back to their serial paths.
+	if (core_) {
+		core_->SetDatabase(&db.GetDatabase());
+	}
+	if (block_store_) {
+		block_store_->SetDatabase(&db.GetDatabase());
+	}
 
 	auto lock = rwlock.GetExclusiveLock();
 	if (info.IsValid()) {
@@ -603,7 +611,7 @@ void AiSaqIndex::EncodePqCodes(ColumnDataCollection &collection) {
 	if (LogInfo(build_log_level_)) {
 		const char *strat_name = build_strategy_ == BuildStrategy::EXACT_PRUNE ? "exact_prune"
 		                         : build_strategy_ == BuildStrategy::PQ_BUFFER ? "pq_buffer"
-		                                                                     : "paged";
+		                                                                       : "paged";
 		fprintf(stderr, "[vindex] AiSAQ build: strategy=%s, N=%llu, pq_buffer=%lluMB", strat_name,
 		        (unsigned long long)N, (unsigned long long)(N * code_size / (1024 * 1024)));
 		if (use_pq_buffer) {
@@ -830,7 +838,7 @@ static constexpr uint64_t kAiSaqStateMagic = 0x3153414944415153ULL; // "SAQIDAIS
 
 void AiSaqIndex::WriteStateStream() {
 	if (state_root_.Get() == 0) {
-		state_root_ = BlockId {};
+		state_root_ = BlockId{};
 	}
 	auto writer = state_store_->BeginStream(state_root_);
 	state_root_ = writer->Root();
@@ -1051,10 +1059,9 @@ void RegisterIndex(DatabaseInstance &db) {
 		    LogicalType::VARCHAR, Value("auto"));
 	}
 	if (!db.config.GetOptionByName("vindex_aisaq_ram_budget_mb")) {
-		db.config.AddExtensionOption(
-		    "vindex_aisaq_ram_budget_mb",
-		    "RAM budget in MB for AiSAQ build-time buffers (0 = auto = 25%% of memory_limit)",
-		    LogicalType::BIGINT, Value::BIGINT(0));
+		db.config.AddExtensionOption("vindex_aisaq_ram_budget_mb",
+		                             "RAM budget in MB for AiSAQ build-time buffers (0 = auto = 25%% of memory_limit)",
+		                             LogicalType::BIGINT, Value::BIGINT(0));
 	}
 
 	db.config.GetIndexTypes().RegisterIndexType(index_type);

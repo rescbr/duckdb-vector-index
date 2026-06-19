@@ -174,9 +174,8 @@ class AiSaqIndexConstructTask final : public ExecutorTask {
 				auto now = std::chrono::steady_clock::now();
 				if (now - last_log > std::chrono::seconds(2)) {
 					const auto built = gstate.built_count.load();
-					fprintf(stderr, "[vindex] graph construction: %llu/%llu (%.0f%%)\n",
-					        (unsigned long long)built, (unsigned long long)total_n,
-					        100.0 * double(built) / double(total_n));
+					fprintf(stderr, "[vindex] graph construction: %llu/%llu (%.0f%%)\n", (unsigned long long)built,
+					        (unsigned long long)total_n, 100.0 * double(built) / double(total_n));
 					last_log = now;
 				}
 			}
@@ -233,22 +232,28 @@ class AiSaqIndexConstructionEvent final : public BasePipelineEvent {
 
 	void FinishEvent() override {
 		const LogLevel ll = gstate.global_index->GetBuildLogLevel();
-		if (LogInfo(ll)) {
+		const bool timing = LogInfo(ll);
+		auto phase_ts = std::chrono::steady_clock::now();
+		auto mark = [&](const char *what) {
+			if (!timing) {
+				return;
+			}
+			const auto now = std::chrono::steady_clock::now();
+			const double ms = std::chrono::duration<double, std::milli>(now - phase_ts).count();
+			fprintf(stderr, "[vindex] %s (%.0fms)\n", what, ms);
+			phase_ts = now;
+		};
+		if (timing) {
 			fprintf(stderr, "[vindex] finalizing inline codes...\n");
 		}
 		gstate.global_index->FinalizeInlineCodes();
-		if (LogInfo(ll)) {
-			fprintf(stderr, "[vindex] computing entry points...\n");
-		}
+		mark("finalize_inline_codes");
 		gstate.global_index->ComputeEntryPoints();
-		if (LogInfo(ll)) {
-			fprintf(stderr, "[vindex] computing label medoids...\n");
-		}
+		mark("compute_entry_points");
 		gstate.global_index->ComputeLabelMedoids();
-		if (LogInfo(ll)) {
-			fprintf(stderr, "[vindex] flushing graph nodes to block store...\n");
-		}
+		mark("compute_label_medoids");
 		gstate.global_index->FlushBuildNodes();
+		mark("flush_graph_nodes");
 		gstate.global_index->ClearBuildBuffers();
 		gstate.global_index->SetDirty();
 		gstate.global_index->SyncSize();
@@ -297,8 +302,7 @@ SinkFinalizeType PhysicalCreateAiSaqIndex::Finalize(Pipeline &pipeline, Event &e
 
 	// Pass 1 prerequisite: train the quantizer before encoding any codes.
 	if (LogInfo(log_level)) {
-		fprintf(stderr, "[vindex] training quantizer on %llu vectors...\n",
-		        (unsigned long long)collection->Count());
+		fprintf(stderr, "[vindex] training quantizer on %llu vectors...\n", (unsigned long long)collection->Count());
 	}
 	gstate.global_index->TrainQuantizer(*collection);
 

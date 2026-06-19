@@ -224,8 +224,10 @@ class AiSaqIndexConstructionEvent final : public BasePipelineEvent {
 	CreateIndexInfo &info;
 	const vector<column_t> &storage_ids;
 	DuckTableEntry &table;
+	std::chrono::steady_clock::time_point schedule_ts;
 
 	void Schedule() override {
+		schedule_ts = std::chrono::steady_clock::now();
 		auto &context = pipeline->GetClientContext();
 		auto &collection = gstate.collection;
 		const idx_t total_n = collection->Count();
@@ -291,6 +293,11 @@ class AiSaqIndexConstructionEvent final : public BasePipelineEvent {
 		const LogLevel ll = global_index->GetBuildLogLevel();
 		const bool timing = LogInfo(ll);
 		auto phase_ts = std::chrono::steady_clock::now();
+		if (timing) {
+			const double construct_ms =
+			    std::chrono::duration<double, std::milli>(phase_ts - schedule_ts).count();
+			fprintf(stderr, "[vindex] pass2_construct (%.0fms)\n", construct_ms);
+		}
 		auto mark = [&](const char *what) {
 			if (!timing) {
 				return;
@@ -371,16 +378,25 @@ SinkFinalizeType PhysicalCreateAiSaqIndex::Finalize(Pipeline &pipeline, Event &e
 	if (LogInfo(log_level)) {
 		fprintf(stderr, "[vindex] training quantizer on %llu vectors...\n", (unsigned long long)collection->Count());
 	}
+	auto t_train_start = std::chrono::steady_clock::now();
 	gstate.global_index->TrainQuantizer(*collection);
+	auto t_train_end = std::chrono::steady_clock::now();
+	if (LogInfo(log_level)) {
+		fprintf(stderr, "[vindex] train_quantizer (%lldms)\n",
+		        (long long)std::chrono::duration_cast<std::chrono::milliseconds>(t_train_end - t_train_start).count());
+	}
 
 	// Pass 1: PQ encoding — write all codes to block-store pages. Also
 	// populates flat build buffers if Tier 2/3 is active.
 	gstate.global_index->SetPqEncodeProgress(&gstate.pq_encoded_count);
+	auto t_pq_start = std::chrono::steady_clock::now();
 	gstate.global_index->EncodePqCodes(*collection);
+	auto t_pq_end = std::chrono::steady_clock::now();
 	gstate.global_index->SetPqEncodeProgress(nullptr);
 	if (LogInfo(log_level)) {
-		fprintf(stderr, "[vindex] PQ encoding complete: %llu vectors\n",
-		        (unsigned long long)gstate.pq_encoded_count.load());
+		fprintf(stderr, "[vindex] PQ encoding complete: %llu vectors in %lldms\n",
+		        (unsigned long long)gstate.pq_encoded_count.load(),
+		        (long long)std::chrono::duration_cast<std::chrono::milliseconds>(t_pq_end - t_pq_start).count());
 	}
 
 	// Pre-size the graph block vectors once, single-threaded, so the

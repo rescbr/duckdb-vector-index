@@ -121,6 +121,48 @@ void PqQuantizer::Train(const float *samples, idx_t n, idx_t dim) {
 		                    codebook_.data() + s * k * sub_dim);
 	}
 	trained_ = true;
+
+	// Phase 9.5 iter 1: precompute centroid-pair distances so CodeDistance
+	// becomes O(m) lookups instead of O(m * sub_dim) simsimd work. This is
+	// the dominant cost during Vamana construction (RobustPrune's O(L²)
+	// pairwise loop calls CodeDistance ~4B times on sift1m).
+	BuildCrossDistanceTable();
+}
+
+void PqQuantizer::BuildCrossDistanceTable() {
+	const idx_t sub_dim = SubDim();
+	const idx_t k = CentroidsPerSlot();
+	cross_distance_table_.assign(idx_t(m_) * k * k, 0.0f);
+	for (idx_t s = 0; s < idx_t(m_); s++) {
+		const float *book = codebook_.data() + s * k * sub_dim;
+		float *table = cross_distance_table_.data() + s * k * k;
+		for (idx_t a = 0; a < k; a++) {
+			const float *ca = book + a * sub_dim;
+			// Diagonal is 0 for L2SQ and -|ca|² for IP; just store 0 for both
+			// since CodeDistance callers only care about relative ordering.
+			// (IP stores -Dot, so diagonal would be -|ca|²; the absolute value
+			// doesn't affect RobustPrune's ranking. Skip for cache density.)
+			table[a * k + a] = 0.0f;
+			for (idx_t b = a + 1; b < k; b++) {
+				const float *cb = book + b * sub_dim;
+				float d;
+				switch (metric_) {
+				case MetricKind::L2SQ:
+					d = L2sq(ca, cb, sub_dim);
+					break;
+				case MetricKind::IP:
+					d = -Dot(ca, cb, sub_dim);
+					break;
+				case MetricKind::COSINE:
+					throw InternalException("PqQuantizer: cosine unreachable");
+				default:
+					d = 0.0f;
+				}
+				table[a * k + b] = d;
+				table[b * k + a] = d; // symmetric
+			}
+		}
+	}
 }
 
 void PqQuantizer::Encode(const float *vec, data_ptr_t code_out) const {
@@ -175,8 +217,22 @@ float PqQuantizer::EstimateDistance(const_data_ptr_t code, const float *query_pr
 }
 
 float PqQuantizer::CodeDistance(const_data_ptr_t code_a, const_data_ptr_t code_b) const {
-	// Code-to-code via centroid lookup. Cheaper than decoding both codes back
-	// to float: O(m · sub_dim) vs O(d) decode + O(d) metric.
+	// Phase 9.5 iter 1: O(m) lookup path via cross_distance_table_. Falls back
+	// to the O(m * sub_dim) codebook path if the table wasn't built (e.g.,
+	// old serialized state loaded without migration — Train() always builds it
+	// for new indexes).
+	if (!cross_distance_table_.empty()) {
+		const idx_t k = CentroidsPerSlot();
+		const float *table_base = cross_distance_table_.data();
+		float acc = 0.0f;
+		for (idx_t s = 0; s < idx_t(m_); s++) {
+			const uint32_t ca = ReadCode(code_a, s);
+			const uint32_t cb = ReadCode(code_b, s);
+			acc += table_base[s * k * k + ca * k + cb];
+		}
+		return acc;
+	}
+	// Legacy fallback — same as pre-Phase-9.5.
 	const idx_t sub_dim = SubDim();
 	const idx_t k = CentroidsPerSlot();
 	float acc = 0.0f;
@@ -247,6 +303,8 @@ void PqQuantizer::Deserialize(const_data_ptr_t in, idx_t size) {
 		std::memcpy(codebook_.data(), in + header, book_bytes);
 	}
 	trained_ = true;
+	// Regenerate the cross-distance table from the restored codebook.
+	BuildCrossDistanceTable();
 }
 
 // ---------------------------------------------------------------------------

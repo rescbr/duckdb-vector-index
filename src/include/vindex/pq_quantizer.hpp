@@ -95,6 +95,20 @@ private:
 	// Flat codebook: for slot s, codebook_[s * (2^bits) * sub_dim .. ] holds
 	// `2^bits` centroids of `sub_dim` floats each.
 	vector<float> codebook_;
+
+	// Phase 9.5 iter 1: precomputed centroid-pair distances.
+	// cross_distance_table_[s * K * K + ca * K + cb] = sub-distance between
+	// centroid ca and cb in slot s. Symmetric (ca,cb) == (cb,ca) for all
+	// supported metrics (L2SQ and IP via -Dot).
+	//
+	// Built once at end of Train() / Deserialize(). Turns CodeDistance from
+	// O(m * sub_dim) simsimd work into O(m) array lookups — ~5-10x faster
+	// for typical SIFT/GIST configs (m=16, K=256, sub_dim=8).
+	//
+	// Memory: m * K * K * sizeof(float). For SIFT: 16 * 256 * 256 * 4 = 4 MB.
+	vector<float> cross_distance_table_;
+
+	void BuildCrossDistanceTable();
 };
 
 } // namespace pq

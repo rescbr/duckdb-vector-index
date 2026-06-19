@@ -5,7 +5,8 @@ official [`vss`](https://github.com/duckdb/duckdb-vss) extension: supports
 HNSW, IVF (IVF-Flat / IVF-RaBitQ / IVF-PQ / IVF-ScaNN), DiskANN (Vamana
 graph with codes held out-of-band so the graph can evict past RAM),
 AiSAQ (Vamana graph whose PQ codes are paged from DuckDB's BufferPool on
-demand, enabling indexes larger than RAM), and
+demand, enabling indexes larger than RAM, with **parallel CREATE INDEX**
+across all CPU cores), and
 SPANN (IVF with closure-replica writes so boundary points survive a
 single-cell probe), with pluggable quantization — RaBitQ (bits ∈
 {1,2,3,4,5,7,8}, default **3-bit**), PQ, and ScaNN anisotropic PQ — plus
@@ -284,6 +285,35 @@ DuckDB's global `memory_limit` and re-paged on access.
 | Search latency | Lower (pointer arithmetic) | Higher (BufferPool pin per code) |
 | Best for | Datasets that fit in RAM | Datasets that exceed RAM |
 
+### Parallel CREATE INDEX
+
+AiSAQ's `CREATE INDEX` is parallelized across all CPU cores via DuckDB's
+`TaskScheduler`. Four phases run in parallel:
+
+1. **Quantizer training** — m=16 k-means++ passes (one per PQ sub-vector slot).
+2. **PQ encoding** (Pass 1) — page-aligned row-range partitioning; each task
+   writes disjoint PQ pages.
+3. **Graph construction** (Pass 2) — Vamana inserts with per-node spinlocks
+   for reciprocal edges (no global lock during construction).
+4. **Post-build** — `FinalizeInlineCodes`, `ComputeLabelMedoids`, and
+   `WriteAllGraphNodes` each partition by disjoint ranges.
+
+Build-time performance on [SIFT1M](http://corpus-texmex.irisa.fr/)
+(1M × 128-d, `pq_buffer` strategy, 10-core host):
+
+| Phase | Serial | Parallel (10 cores) | Speedup |
+|---|---|---|---|
+| Quantizer training | 5.9 s | 1.2 s | 4.9× |
+| PQ encoding | 3.3 s | 0.7 s | 4.6× |
+| Graph construction | ~140 s | ~20 s | 7× |
+| Post-build | 2.8 s | <0.1 s | 28×+ |
+| **Total** | **~152 s** | **~22 s** | **6.9×** |
+
+Recall is identical between serial and parallel builds — the per-node
+spinlock strategy produces graph topology equivalent to serial insertion
+(recall within 0.001 on all bench configurations). Enable
+`SET vindex_log_level = 'info'` to see per-phase wall-clock timing.
+
 ### Build acceleration
 
 AiSAQ supports a three-tier build acceleration system controlled by
@@ -359,9 +389,20 @@ session option or the `VINDEX_LOG_LEVEL` environment variable (env var
 overrides session option):
 
 ```sql
-SET vindex_log_level = 'info';    -- phase milestones, throttled 2s
+SET vindex_log_level = 'info';    -- phase milestones + per-phase wall-clock timing
 SET vindex_log_level = 'debug';   -- per-page granularity
 SET vindex_log_level = 'profile'; -- per-insert timing breakdowns
+```
+
+At `info` level, AiSAQ parallel build prints per-phase wall-clock times:
+
+```
+[vindex] train_quantizer (1207ms)
+[vindex] PQ encoding complete: 1000000 vectors in 734ms (10 tasks)
+[vindex] pass2_construct (20134ms)
+[vindex] merge_parallel_construct (49ms)
+[vindex] finalize_inline_codes (0ms)
+[vindex] flush_graph_nodes (63ms)
 ```
 
 ```sh

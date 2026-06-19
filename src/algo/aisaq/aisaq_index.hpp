@@ -98,6 +98,33 @@ class AiSaqIndex : public VectorIndex {
 			block_store_->EnsureGraphCapacity(static_cast<uint32_t>(N));
 		}
 	}
+	// Phase 9 Task 5 parallel-construct path: pre-reserve all N internal_ids
+	// (counter goes 0 -> N) so each task can use internal_id = row_ordinal
+	// deterministically. Returns the prior counter (0 on first call). Must
+	// be called once, single-threaded, after PreAllocateGraphCapacity.
+	uint32_t PreAllocateGraphRange(idx_t N) {
+		return block_store_ ? block_store_->AllocGraphNodeRange(static_cast<uint32_t>(N)) : 0;
+	}
+	// Periodic reciprocity apply during parallel construction (Phase 9 Task 5).
+	// Each task accumulates per-insert deferred back-edges in its own vector
+	// and periodically (every K rows) calls this to drain them under the
+	// rwlock. The final end-of-build apply in FinalizeParallelConstruct still
+	// runs, but with a much smaller residual set.
+	//
+	// Without periodic apply, deferred reciprocity at the end produces a
+	// heavily-alpha-pruned star topology (entry node ends up with too few
+	// neighbors because all N*R back-edges to it are re-pruned in one shot).
+	// Periodic apply mirrors the old serial "apply per-insert" behavior
+	// closely enough to preserve recall, at the cost of K-acquires of the
+	// rwlock per task.
+	void ApplyPeriodicReciprocals(vector<DeferredReciprocal> &task_deferred) {
+		if (task_deferred.empty()) {
+			return;
+		}
+		auto lock = rwlock.GetExclusiveLock();
+		core_->ApplyDeferredReciprocals(task_deferred);
+		task_deferred.clear();
+	}
 	// Populate flat PQ codes + full-precision vectors during EncodePqCodes.
 	// Activate the buffers on the core.
 	void ActivateBuildBuffers();
@@ -117,6 +144,43 @@ class AiSaqIndex : public VectorIndex {
 	idx_t QuantizerCodeSize() const {
 		return quantizer_ ? quantizer_->CodeSize() : 0;
 	}
+
+	// --- Phase 9 Task 5 parallel construct coordination ---------------------
+	// The build event (aisaq_build.cpp) drives parallel Pass 2 via this API:
+	//   1. InitParallelConstructCollector(num_tasks): size the per-task slots.
+	//   2. LeaderInsertEntry(...): pre-insert row 0 as the entry point (serial).
+	//   3. Per task: InsertBuildRange(...) scans a disjoint row range, calls
+	//      AiSaqCore::InsertBuild, writes per-task local maps.
+	//   4. PushParallelConstructResults(task_id, ...): handoff local maps.
+	//   5. FinalizeParallelConstruct(): merge maps, sort + apply deferred.
+	void InitParallelConstructCollector(idx_t num_slots);
+	// Leader insert of row 0 (or the first non-NULL row). Returns the
+	// internal_id used as the entry point, or DConstants::INVALID_INDEX if
+	// the collection is empty/all-NULL.
+	idx_t LeaderInsertEntry(ClientContext &context, ColumnDataCollection &collection);
+	// Per-task build worker: scan rows [row_start, row_end) from `collection`,
+	// call AiSaqCore::InsertBuild(internal_id=row_ordinal, ...) with the
+	// task's own VamanaTLS, and accumulate per-task local maps. Skips NULL
+	// vectors and the already-inserted entry row.
+	void InsertBuildRange(ClientContext &context, ColumnDataCollection &collection, idx_t row_start, idx_t row_end,
+	                      idx_t skip_row, vamana::VamanaTLS &tls, vector<DeferredReciprocal> &deferred,
+	                      unordered_map<row_t, uint32_t> &local_row_to_internal,
+	                      unordered_map<uint32_t, int64_t> &local_id2label,
+	                      unordered_map<int64_t, vector<uint32_t>> &local_label2ids, atomic<idx_t> &built_count,
+	                      size_t thread_id, idx_t periodic_apply_k);
+	// Move a task's local maps into its slot. thread_id must be < num_slots
+	// passed to InitParallelConstructCollector.
+	void PushParallelConstructResults(idx_t thread_id, vector<DeferredReciprocal> &&deferred,
+	                                  unordered_map<row_t, uint32_t> &&local_row_to_internal,
+	                                  unordered_map<uint32_t, int64_t> &&local_id2label,
+	                                  unordered_map<int64_t, vector<uint32_t>> &&local_label2ids);
+	// Serial post-pass (called from FinishEvent under the rwlock):
+	//   1. Merge per-task label maps into core's global maps.
+	//   2. Merge per-task row_to_internal into the index's row_to_internal_.
+	//   3. Sort the merged deferred list by new_internal_id (deterministic).
+	//   4. core_->ApplyDeferredReciprocals(merged_deferred).
+	//   5. core_->SetSize(total_n).
+	void FinalizeParallelConstruct(idx_t total_n);
 
 	void VerifyBuffers(IndexLock &lock) override;
 
@@ -164,6 +228,11 @@ class AiSaqIndex : public VectorIndex {
 	}
 	idx_t EntryPoints() const {
 		return params_.n_entry_points;
+	}
+	// Read-only access to the core params (Phase 9 Task 5: per-task VamanaTLS
+	// is seeded from params_.seed + thread_id).
+	const AiSaqCoreParams &CoreParams() const {
+		return params_;
 	}
 	idx_t GraphBlockCount() const {
 		return block_store_ ? block_store_->GraphBlockCount() : 0;
@@ -215,6 +284,17 @@ class AiSaqIndex : public VectorIndex {
 
 	StorageLock rwlock;
 	atomic<idx_t> index_size = {0};
+
+	// Phase 9 Task 5 parallel-construct per-task collector. Each task owns a
+	// slot (indexed by its thread_id); the event reads them serially in
+	// FinishEvent. Pre-sized by InitParallelConstructCollector.
+	struct ParallelSlot {
+		vector<DeferredReciprocal> deferred;
+		unordered_map<row_t, uint32_t> row_to_internal;
+		unordered_map<uint32_t, int64_t> id2label;
+		unordered_map<int64_t, vector<uint32_t>> label2ids;
+	};
+	vector<ParallelSlot> parallel_slots_;
 
 	void InitFromOptions(const case_insensitive_map_t<Value> &options, idx_t vector_size, MetricKind metric);
 

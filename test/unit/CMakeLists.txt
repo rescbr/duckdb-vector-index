@@ -24,6 +24,7 @@ add_executable(vindex_unit
     test_diskann_core.cpp
     test_spann_core.cpp
     test_aisaq_core.cpp
+    test_vamana_concurrency.cpp
     ${PROJECT_SOURCE_DIR}/src/common/metric.cpp
     ${PROJECT_SOURCE_DIR}/src/common/index_block_store.cpp
     ${PROJECT_SOURCE_DIR}/src/algo/hnsw/hnsw_core.cpp

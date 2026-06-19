@@ -16,7 +16,9 @@
 
 #include "algo/aisaq/aisaq_index.hpp"
 #include "vindex/logging.hpp"
+#include "vindex/vamana.hpp"
 
+#include <algorithm>
 #include <chrono>
 
 namespace duckdb {
@@ -137,58 +139,73 @@ SinkCombineResultType PhysicalCreateAiSaqIndex::Combine(ExecutionContext &contex
 //-------------------------------------------------------------
 // Finalize — two-pass build
 //-------------------------------------------------------------
+
+// Parallel Vamana construct task (Phase 9 Task 5). Each task:
+//   - Owns a disjoint row range [row_start, row_end).
+//   - Owns its VamanaTLS (per-thread scratch) + deferred vector + local maps.
+//   - Scans its row range via a private ColumnDataScanState (NOT the shared
+//     parallel scan state — that interleaves chunks and would break the
+//     internal_id <-> PQ-slot mapping).
+//   - Calls AiSaqIndex::InsertBuildRange which forwards to
+//     AiSaqCore::InsertBuild with internal_id = row_ordinal deterministically.
+//
+// On completion, hands its local maps to AiSaqIndex's parallel_slots_ via
+// PushParallelConstructResults. FinishEvent merges them serially.
+//
+// No rwlock is held during ExecuteTask: per-task state + deferred reciprocity
+// handles graph-state safety. The serial ApplyDeferredReciprocals step in
+// FinishEvent re-acquires the rwlock.
 class AiSaqIndexConstructTask final : public ExecutorTask {
   public:
 	AiSaqIndexConstructTask(shared_ptr<Event> event_p, ClientContext &context, CreateAiSaqIndexGlobalState &gstate_p,
-	                        size_t thread_id_p, const PhysicalCreateAiSaqIndex &op_p)
-	    : ExecutorTask(context, std::move(event_p), op_p), gstate(gstate_p), thread_id(thread_id_p) {
-		gstate.collection->InitializeScanChunk(scan_chunk);
+	                        size_t thread_id_p, idx_t row_start_p, idx_t row_end_p, idx_t skip_row_p,
+	                        const PhysicalCreateAiSaqIndex &op_p)
+	    : ExecutorTask(context, std::move(event_p), op_p), gstate(gstate_p), thread_id(thread_id_p),
+	      row_start(row_start_p), row_end(row_end_p), skip_row(skip_row_p),
+	      tls_(gstate_p.global_index->CoreParams().seed + thread_id_p + 1) {
 	}
 
-	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
-		auto &scan_state = gstate.scan_state;
+	TaskExecutionResult ExecuteTask(TaskExecutionMode /*mode*/) override {
 		auto &collection = gstate.collection;
+		auto &global_index = gstate.global_index;
 
-		DataChunk build_chunk;
-		build_chunk.Initialize(executor.context, {scan_chunk.data[0].GetType()});
-		Vector row_ids(LogicalType::ROW_TYPE);
-
-		const bool has_labels = gstate.has_labels;
-		const idx_t row_id_col = has_labels ? 2 : 1;
-		const LogLevel log_level = gstate.global_index->GetBuildLogLevel();
 		const idx_t total_n = collection->Count();
+		const LogLevel log_level = global_index->GetBuildLogLevel();
 		auto last_log = std::chrono::steady_clock::now();
 
-		while (collection->Scan(scan_state, local_scan_state, scan_chunk)) {
-			const auto count = scan_chunk.size();
-			build_chunk.Reset();
-			build_chunk.data[0].Reference(scan_chunk.data[0]);
-			build_chunk.SetCardinality(count);
-			row_ids.Reference(scan_chunk.data[row_id_col]);
+		// Periodic-reciprocity cadence: each task acquires the rwlock and
+		// drains its accumulated deferred every `periodic_apply_k` inserts.
+		// A fixed small K (~16) keeps the build-time graph dense enough that
+		// later inserts' BeamSearch finds cross-task neighbors, preserving
+		// serial-equivalent recall. A larger K (e.g. my_range/8) speed up the
+		// parallel phase but degrades recall — at K=125 on siftsmall the
+		// recall dropped from 0.999 to 0.94-0.96 due to the deferred-at-end
+		// alpha-prune collapsing the entry node's neighbor list.
+		//
+		// K=16 is a sweet spot: 16 inserts between lock acquires gives enough
+		// parallel headway to engage all cores while keeping the graph dense.
+		// See the Task 5 report for the K-sweep measurements.
+		constexpr idx_t periodic_apply_k = 16;
 
-			Vector *labels = has_labels ? &scan_chunk.data[1] : nullptr;
-			gstate.global_index->Construct(build_chunk, row_ids, thread_id, labels);
-			gstate.built_count += count;
+		global_index->InsertBuildRange(executor.context, *collection, row_start, row_end, skip_row, tls_, deferred_,
+		                               local_row_to_internal_, local_id2label_, local_label2ids_, gstate.built_count,
+		                               thread_id, periodic_apply_k);
 
-			if (LogInfo(log_level)) {
-				auto now = std::chrono::steady_clock::now();
-				if (now - last_log > std::chrono::seconds(2)) {
-					const auto built = gstate.built_count.load();
-					fprintf(stderr, "[vindex] graph construction: %llu/%llu (%.0f%%)\n", (unsigned long long)built,
-					        (unsigned long long)total_n, 100.0 * double(built) / double(total_n));
-					last_log = now;
-				}
-			}
-
-			if (mode == TaskExecutionMode::PROCESS_PARTIAL) {
-				return TaskExecutionResult::TASK_NOT_FINISHED;
-			}
-		}
-
+		// Log throttled progress (built_count is shared across tasks).
 		if (LogInfo(log_level)) {
-			fprintf(stderr, "[vindex] graph construction: %llu/%llu (100%%)\n",
-			        (unsigned long long)gstate.built_count.load(), (unsigned long long)total_n);
+			auto now = std::chrono::steady_clock::now();
+			if (now - last_log > std::chrono::seconds(2)) {
+				const auto built = gstate.built_count.load();
+				fprintf(stderr, "[vindex] graph construction: %llu/%llu (%.0f%%)\n", (unsigned long long)built,
+				        (unsigned long long)total_n, 100.0 * double(built) / double(total_n));
+				last_log = now;
+			}
 		}
+
+		// Hand off local state to the event's collector.
+		global_index->PushParallelConstructResults(thread_id, std::move(deferred_), std::move(local_row_to_internal_),
+		                                           std::move(local_id2label_), std::move(local_label2ids_));
+
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
 	}
@@ -196,9 +213,14 @@ class AiSaqIndexConstructTask final : public ExecutorTask {
   private:
 	CreateAiSaqIndexGlobalState &gstate;
 	size_t thread_id;
-
-	DataChunk scan_chunk;
-	ColumnDataLocalScanState local_scan_state;
+	idx_t row_start;
+	idx_t row_end;
+	idx_t skip_row;
+	vamana::VamanaTLS tls_;
+	vector<DeferredReciprocal> deferred_;
+	unordered_map<row_t, uint32_t> local_row_to_internal_;
+	unordered_map<uint32_t, int64_t> local_id2label_;
+	unordered_map<int64_t, vector<uint32_t>> local_label2ids_;
 };
 
 class AiSaqIndexConstructionEvent final : public BasePipelineEvent {
@@ -218,20 +240,62 @@ class AiSaqIndexConstructionEvent final : public BasePipelineEvent {
 
 	void Schedule() override {
 		auto &context = pipeline->GetClientContext();
-		// Pass 2 must run single-threaded: AllocGraphNode assigns internal_ids
-		// in insertion order, and those internal_ids must line up 1:1 with the
-		// PQ code page slots written during EncodePqCodes (pass 1). Spreading
-		// construction across threads would interleave chunks non-deterministically
-		// under the index rwlock and scramble the internal_id ↔ code mapping.
-		// AiSaqCore::Insert is not internally thread-safe either, so a single
-		// task is both necessary and sufficient.
+		auto &collection = gstate.collection;
+		const idx_t total_n = collection->Count();
+
+		if (total_n == 0) {
+			// Nothing to construct; FinishEvent still runs the post-build
+			// phases (they no-op on empty state).
+			return;
+		}
+
+		auto &global_index = gstate.global_index;
+
+		// Pre-reserve [0, total_n) in one atomic step. This bumps
+		// graph_node_count_ to total_n so every internal_id in [0, total_n)
+		// passes PinGraphNode's D_ASSERT, and each task can use
+		// internal_id = row_ordinal deterministically.
+		global_index->PreAllocateGraphRange(total_n);
+
+		// Parallel-construct collector: +1 slot for the leader (slot 0).
+		auto &scheduler = TaskScheduler::GetScheduler(context);
+		const size_t num_threads = std::max<size_t>(1, NumericCast<size_t>(scheduler.NumberOfThreads()));
+		const size_t num_tasks = std::min<size_t>(num_threads, std::max<idx_t>(1, total_n - 1));
+		global_index->InitParallelConstructCollector(num_tasks + 1);
+
+		// Leader: serially insert the first non-NULL row as the entry point.
+		// This sets entry_internal_ + size_=1 before any task spawns, so every
+		// parallel BeamSearch has a valid entry point.
+		const idx_t entry_row = global_index->LeaderInsertEntry(context, *collection);
+
+		if (entry_row == DConstants::INVALID_INDEX) {
+			// All rows NULL — nothing to construct.
+			return;
+		}
+
+		// Spawn num_tasks tasks for rows [1, total_n) \ {entry_row}.
+		// entry_row is always 0 in practice (first non-NULL row), but we pass
+		// it explicitly so tasks can skip it even if partitioning puts it
+		// inside their range.
 		vector<shared_ptr<Task>> construct_tasks;
-		construct_tasks.push_back(make_uniq<AiSaqIndexConstructTask>(shared_from_this(), context, gstate, 0, op));
+		const idx_t work_n = total_n - 1; // rows [1, total_n)
+		for (size_t t = 0; t < num_tasks; t++) {
+			const idx_t start = 1 + idx_t(t) * work_n / num_tasks;
+			const idx_t end = 1 + idx_t(t + 1) * work_n / num_tasks;
+			if (start >= end) {
+				continue;
+			}
+			construct_tasks.push_back(make_shared_ptr<AiSaqIndexConstructTask>(shared_from_this(), context, gstate,
+			                                                                   t + 1, start, end, entry_row, op));
+		}
 		SetTasks(std::move(construct_tasks));
 	}
 
 	void FinishEvent() override {
-		const LogLevel ll = gstate.global_index->GetBuildLogLevel();
+		auto &global_index = gstate.global_index;
+		auto &collection = gstate.collection;
+		const idx_t total_n = collection->Count();
+		const LogLevel ll = global_index->GetBuildLogLevel();
 		const bool timing = LogInfo(ll);
 		auto phase_ts = std::chrono::steady_clock::now();
 		auto mark = [&](const char *what) {
@@ -243,20 +307,28 @@ class AiSaqIndexConstructionEvent final : public BasePipelineEvent {
 			fprintf(stderr, "[vindex] %s (%.0fms)\n", what, ms);
 			phase_ts = now;
 		};
+
+		// (1) Merge per-task maps, sort + apply deferred reciprocity, set size.
+		// This is the serial tail of parallel Pass 2 — runs under rwlock.
+		if (total_n > 0) {
+			global_index->FinalizeParallelConstruct(total_n);
+		}
+		mark("apply_deferred_reciprocals");
+
 		if (timing) {
 			fprintf(stderr, "[vindex] finalizing inline codes...\n");
 		}
-		gstate.global_index->FinalizeInlineCodes();
+		global_index->FinalizeInlineCodes();
 		mark("finalize_inline_codes");
-		gstate.global_index->ComputeEntryPoints();
+		global_index->ComputeEntryPoints();
 		mark("compute_entry_points");
-		gstate.global_index->ComputeLabelMedoids();
+		global_index->ComputeLabelMedoids();
 		mark("compute_label_medoids");
-		gstate.global_index->FlushBuildNodes();
+		global_index->FlushBuildNodes();
 		mark("flush_graph_nodes");
-		gstate.global_index->ClearBuildBuffers();
-		gstate.global_index->SetDirty();
-		gstate.global_index->SyncSize();
+		global_index->ClearBuildBuffers();
+		global_index->SetDirty();
+		global_index->SyncSize();
 
 		auto &storage = table.GetStorage();
 		if (!storage.db.GetStorageManager().InMemory()) {
@@ -280,7 +352,7 @@ class AiSaqIndexConstructionEvent final : public BasePipelineEvent {
 		const auto index_entry = schema.CreateIndex(schema.GetCatalogTransaction(*gstate.context), info, table).get();
 		D_ASSERT(index_entry);
 		auto &duck_index = index_entry->Cast<DuckIndexEntry>();
-		duck_index.initial_index_size = gstate.global_index->Cast<BoundIndex>().GetInMemorySize();
+		duck_index.initial_index_size = global_index->Cast<BoundIndex>().GetInMemorySize();
 
 		storage.AddIndex(std::move(gstate.global_index));
 	}

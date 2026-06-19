@@ -796,6 +796,245 @@ void AiSaqIndex::Construct(DataChunk &input, Vector &row_ids, idx_t /*thread_idx
 	index_size = core_->Size();
 }
 
+// ---------------------------------------------------------------------------
+// Phase 9 Task 5: parallel Pass 2 (Construct) coordination.
+//
+// The single-task path (above) takes the rwlock per-chunk and serializes every
+// insert. The parallel path replaces it with:
+//
+//   1. LeaderInsertEntry (serial, in Schedule): reserve [0, N), insert row 0
+//      (or first non-NULL) as the entry point.
+//   2. N parallel InsertBuildRange tasks (in ExecuteTask): each task scans a
+//      disjoint row range, calls AiSaqCore::InsertBuild with its own VamanaTLS,
+//      accumulates per-task deferred reciprocals + local maps.
+//   3. PushParallelConstructResults: each task moves its local maps into its
+//      slot in parallel_slots_.
+//   4. FinalizeParallelConstruct (serial, in FinishEvent, under rwlock):
+//      merge maps, sort + apply deferred, set final size.
+//
+// No rwlock is held during the parallel insert phase. The deferred-reciprocity
+// strategy ensures graph-state safety: forward edges are written to
+// task-exclusive internal_ids; back-edges are queued and applied serially.
+// ---------------------------------------------------------------------------
+
+void AiSaqIndex::InitParallelConstructCollector(idx_t num_slots) {
+	parallel_slots_.clear();
+	parallel_slots_.resize(num_slots);
+}
+
+idx_t AiSaqIndex::LeaderInsertEntry(ClientContext & /*context*/, ColumnDataCollection &collection) {
+	// Scan from row 0 forward until we find a non-NULL row. That row becomes
+	// the entry point (entry_internal_ = its row_ordinal).
+	ColumnDataScanState scan_state;
+	collection.InitializeScan(scan_state, ColumnDataScanProperties::ALLOW_ZERO_COPY);
+	DataChunk scan_chunk;
+	collection.InitializeScanChunk(scan_chunk);
+
+	const idx_t total_n = collection.Count();
+	if (total_n == 0) {
+		return DConstants::INVALID_INDEX;
+	}
+
+	const idx_t row_id_col = !label_column_.empty() ? 2 : 1;
+	const bool has_labels = !label_column_.empty();
+
+	vamana::VamanaTLS leader_tls(params_.seed);
+	vector<DeferredReciprocal> leader_deferred;
+	unordered_map<row_t, uint32_t> leader_row_to_internal;
+	unordered_map<uint32_t, int64_t> leader_id2label;
+	unordered_map<int64_t, vector<uint32_t>> leader_label2ids;
+
+	idx_t entry_row = DConstants::INVALID_INDEX;
+	while (collection.Scan(scan_state, scan_chunk)) {
+		const auto chunk_size = scan_chunk.size();
+		if (chunk_size == 0) {
+			continue;
+		}
+		scan_chunk.Flatten();
+		auto &vec_vec = scan_chunk.data[0];
+		auto &child_vec = ArrayVector::GetEntry(vec_vec);
+		const auto array_size = ArrayType::GetSize(vec_vec.GetType());
+		auto vec_child_data = FlatVector::GetData<float>(child_vec);
+		auto rowid_data = FlatVector::GetData<row_t>(scan_chunk.data[row_id_col]);
+		const int64_t *label_data = has_labels ? FlatVector::GetData<int64_t>(scan_chunk.data[1]) : nullptr;
+
+		for (idx_t i = 0; i < chunk_size; i++) {
+			if (FlatVector::IsNull(vec_vec, i)) {
+				continue;
+			}
+			const idx_t row_ordinal = scan_state.current_row_index + i;
+			const auto rowid = rowid_data[i];
+			const int64_t label =
+			    (label_data && !FlatVector::IsNull(scan_chunk.data[1], i)) ? label_data[i] : INT64_MIN;
+
+			// InsertBuild hits the "size_ == 0" branch and sets entry_internal_.
+			core_->InsertBuild(static_cast<uint32_t>(row_ordinal), int64_t(rowid), vec_child_data + i * array_size,
+			                   label, leader_tls, leader_deferred, leader_id2label, leader_label2ids);
+			leader_row_to_internal[rowid] = static_cast<uint32_t>(row_ordinal);
+			entry_row = row_ordinal;
+			break;
+		}
+		if (entry_row != DConstants::INVALID_INDEX) {
+			break;
+		}
+	}
+
+	// Stash leader outputs into slot 0 (caller will merge them in Finalize).
+	if (entry_row != DConstants::INVALID_INDEX && !parallel_slots_.empty()) {
+		parallel_slots_[0].deferred = std::move(leader_deferred);
+		parallel_slots_[0].row_to_internal = std::move(leader_row_to_internal);
+		parallel_slots_[0].id2label = std::move(leader_id2label);
+		parallel_slots_[0].label2ids = std::move(leader_label2ids);
+	}
+	return entry_row;
+}
+
+void AiSaqIndex::InsertBuildRange(ClientContext & /*context*/, ColumnDataCollection &collection, idx_t row_start,
+                                  idx_t row_end, idx_t skip_row, vamana::VamanaTLS &tls,
+                                  vector<DeferredReciprocal> &deferred,
+                                  unordered_map<row_t, uint32_t> &local_row_to_internal,
+                                  unordered_map<uint32_t, int64_t> &local_id2label,
+                                  unordered_map<int64_t, vector<uint32_t>> &local_label2ids, atomic<idx_t> &built_count,
+                                  size_t /*thread_id*/, idx_t periodic_apply_k) {
+	if (row_start >= row_end) {
+		return;
+	}
+
+	const idx_t row_id_col = !label_column_.empty() ? 2 : 1;
+	const bool has_labels = !label_column_.empty();
+
+	ColumnDataScanState scan_state;
+	collection.InitializeScan(scan_state, ColumnDataScanProperties::ALLOW_ZERO_COPY);
+	DataChunk scan_chunk;
+	collection.InitializeScanChunk(scan_chunk);
+
+	idx_t inserts_since_apply = 0;
+	auto maybe_apply = [&]() {
+		if (periodic_apply_k > 0 && inserts_since_apply >= periodic_apply_k) {
+			ApplyPeriodicReciprocals(deferred);
+			inserts_since_apply = 0;
+		}
+	};
+
+	auto process_chunk = [&](DataChunk &chunk, idx_t chunk_base) {
+		const auto chunk_size = chunk.size();
+		if (chunk_size == 0) {
+			return;
+		}
+		chunk.Flatten();
+		auto &vec_vec = chunk.data[0];
+		auto &child_vec = ArrayVector::GetEntry(vec_vec);
+		const auto array_size = ArrayType::GetSize(vec_vec.GetType());
+		auto vec_child_data = FlatVector::GetData<float>(child_vec);
+		auto rowid_data = FlatVector::GetData<row_t>(chunk.data[row_id_col]);
+		const int64_t *label_data = has_labels ? FlatVector::GetData<int64_t>(chunk.data[1]) : nullptr;
+
+		for (idx_t i = 0; i < chunk_size; i++) {
+			const idx_t row_ordinal = chunk_base + i;
+			if (row_ordinal < row_start) {
+				continue;
+			}
+			if (row_ordinal >= row_end) {
+				return;
+			}
+			if (FlatVector::IsNull(vec_vec, i)) {
+				continue;
+			}
+			if (row_ordinal == skip_row) {
+				continue; // already inserted by the leader
+			}
+
+			const auto rowid = rowid_data[i];
+			const int64_t label = (label_data && !FlatVector::IsNull(chunk.data[1], i)) ? label_data[i] : INT64_MIN;
+
+			core_->InsertBuild(static_cast<uint32_t>(row_ordinal), int64_t(rowid), vec_child_data + i * array_size,
+			                   label, tls, deferred, local_id2label, local_label2ids);
+			local_row_to_internal[rowid] = static_cast<uint32_t>(row_ordinal);
+			built_count.fetch_add(1, std::memory_order_relaxed);
+			inserts_since_apply++;
+			maybe_apply();
+		}
+	};
+
+	// Position the scan at the chunk containing row_start. The chunk may
+	// begin before row_start (chunk boundaries aren't necessarily row-aligned);
+	// process_chunk discards leading rows outside [row_start, row_end).
+	if (row_start > 0) {
+		if (!collection.Seek(row_start, scan_state, scan_chunk)) {
+			return;
+		}
+		process_chunk(scan_chunk, scan_state.current_row_index);
+	}
+
+	while (collection.Scan(scan_state, scan_chunk)) {
+		if (scan_state.current_row_index >= row_end) {
+			break;
+		}
+		process_chunk(scan_chunk, scan_state.current_row_index);
+	}
+
+	// No final apply here — the task's residual deferred is handed off to
+	// AiSaqIndex::parallel_slots_ and merged in FinalizeParallelConstruct.
+}
+
+void AiSaqIndex::PushParallelConstructResults(idx_t thread_id, vector<DeferredReciprocal> &&deferred,
+                                              unordered_map<row_t, uint32_t> &&local_row_to_internal,
+                                              unordered_map<uint32_t, int64_t> &&local_id2label,
+                                              unordered_map<int64_t, vector<uint32_t>> &&local_label2ids) {
+	D_ASSERT(idx_t(thread_id) < parallel_slots_.size());
+	auto &slot = parallel_slots_[thread_id];
+	slot.deferred = std::move(deferred);
+	slot.row_to_internal = std::move(local_row_to_internal);
+	slot.id2label = std::move(local_id2label);
+	slot.label2ids = std::move(local_label2ids);
+}
+
+void AiSaqIndex::FinalizeParallelConstruct(idx_t total_n) {
+	auto lock = rwlock.GetExclusiveLock();
+
+	// (1) Merge per-task label maps into core_'s global maps.
+	for (const auto &slot : parallel_slots_) {
+		core_->MergeLabelMaps(slot.id2label, slot.label2ids);
+	}
+
+	// (2) Merge per-task row_to_internal into index's row_to_internal_.
+	for (const auto &slot : parallel_slots_) {
+		for (const auto &kv : slot.row_to_internal) {
+			row_to_internal_[kv.first] = kv.second;
+		}
+	}
+
+	// (3) Concatenate per-task deferred lists, then sort by new_internal_id
+	// for deterministic output regardless of thread scheduling.
+	vector<DeferredReciprocal> all_deferred;
+	idx_t total_deferred = 0;
+	for (const auto &slot : parallel_slots_) {
+		total_deferred += slot.deferred.size();
+	}
+	all_deferred.reserve(total_deferred);
+	for (const auto &slot : parallel_slots_) {
+		all_deferred.insert(all_deferred.end(), slot.deferred.begin(), slot.deferred.end());
+	}
+	std::sort(all_deferred.begin(), all_deferred.end(), [](const DeferredReciprocal &a, const DeferredReciprocal &b) {
+		return a.new_internal_id < b.new_internal_id;
+	});
+
+	// (4) Apply deferred reciprocity (serial). core_->ApplyDeferredReciprocals
+	// uses tls_ for any overflow re-prune work.
+	if (!all_deferred.empty()) {
+		core_->ApplyDeferredReciprocals(all_deferred);
+	}
+
+	// (5) Set the final node count. Tasks didn't bump size_ during InsertBuild
+	// (that would race); set it once here.
+	core_->SetSize(static_cast<uint32_t>(total_n));
+	index_size = core_->Size();
+
+	// Drop the per-task slots (frees memory before post-build phases run).
+	parallel_slots_.clear();
+	parallel_slots_.shrink_to_fit();
+}
+
 void AiSaqIndex::Compact() {
 	is_dirty = true;
 	auto lock = rwlock.GetExclusiveLock();

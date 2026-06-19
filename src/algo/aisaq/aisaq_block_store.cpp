@@ -85,6 +85,21 @@ uint32_t AiSaqBlockStore::AllocGraphNode() {
 	return id;
 }
 
+uint32_t AiSaqBlockStore::AllocGraphNodeRange(uint32_t count) {
+	// Batched reservation. Same atomic semantics as AllocGraphNode, just
+	// fetch_add(count) instead of fetch_add(1). Returned start = prior value,
+	// so the caller owns [start, start + count). When count == 0, returns
+	// the current counter without mutation.
+	if (count == 0) {
+		return graph_node_count_.load(std::memory_order_relaxed);
+	}
+	const uint32_t start = graph_node_count_.fetch_add(count, std::memory_order_relaxed);
+	if (!flat_build_mode_.load(std::memory_order_relaxed)) {
+		EnsureGraphCapacity(start + count - 1);
+	}
+	return start;
+}
+
 void AiSaqBlockStore::WriteAllGraphNodesRange(const uint8_t *flat, idx_t count, idx_t block_start, idx_t block_end) {
 	for (idx_t block_idx = block_start; block_idx < block_end; block_idx++) {
 		D_ASSERT(block_idx < graph_block_handles_.size());

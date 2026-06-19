@@ -154,7 +154,7 @@ uint32_t AiSaqCore::PickEntryPoint(const float *query_lut) const {
 // ---------------------------------------------------------------------------
 
 vector<AiSaqCore::Candidate> AiSaqCore::BeamSearch(const float *query_lut, idx_t L, idx_t io_limit,
-                                                   const vector<uint32_t> *forced_entry_points,
+                                                   vamana::VamanaTLS &tls, const vector<uint32_t> *forced_entry_points,
                                                    const LabelFilter *label_filter) const {
 	vector<Candidate> out;
 	if (size_ == 0 || L == 0) {
@@ -162,7 +162,7 @@ vector<AiSaqCore::Candidate> AiSaqCore::BeamSearch(const float *query_lut, idx_t
 	}
 	L = std::max<idx_t>(L, 1);
 
-	const uint32_t vc = tls_.NextVisitEpoch();
+	const uint32_t vc = tls.NextVisitEpoch();
 
 	std::priority_queue<FrontierItem, std::vector<FrontierItem>, FrontierCmp> frontier;
 	std::priority_queue<WorkingItem, std::vector<WorkingItem>, WorkingCmp> W;
@@ -172,13 +172,13 @@ vector<AiSaqCore::Candidate> AiSaqCore::BeamSearch(const float *query_lut, idx_t
 	// Seed entry points.
 	if (forced_entry_points && !forced_entry_points->empty()) {
 		for (uint32_t ep_id : *forced_entry_points) {
-			if (ep_id >= tls_.visit_marks.size()) {
-				tls_.visit_marks.resize(std::max<size_t>(tls_.visit_marks.size() * 2, size_t(ep_id) + 1), 0);
+			if (ep_id >= tls.visit_marks.size()) {
+				tls.visit_marks.resize(std::max<size_t>(tls.visit_marks.size() * 2, size_t(ep_id) + 1), 0);
 			}
-			if (tls_.visit_marks[ep_id] == vc) {
+			if (tls.visit_marks[ep_id] == vc) {
 				continue;
 			}
-			tls_.visit_marks[ep_id] = vc;
+			tls.visit_marks[ep_id] = vc;
 			io_count++;
 			const float d = DistanceToCode(query_lut, ep_id);
 			frontier.push({d, ep_id});
@@ -189,10 +189,10 @@ vector<AiSaqCore::Candidate> AiSaqCore::BeamSearch(const float *query_lut, idx_t
 		}
 	} else {
 		const uint32_t entry_internal = PickEntryPoint(query_lut);
-		if (entry_internal >= tls_.visit_marks.size()) {
-			tls_.visit_marks.resize(std::max<size_t>(tls_.visit_marks.size() * 2, size_t(entry_internal) + 1), 0);
+		if (entry_internal >= tls.visit_marks.size()) {
+			tls.visit_marks.resize(std::max<size_t>(tls.visit_marks.size() * 2, size_t(entry_internal) + 1), 0);
 		}
-		tls_.visit_marks[entry_internal] = vc;
+		tls.visit_marks[entry_internal] = vc;
 		io_count++;
 		const float entry_dist = DistanceToCode(query_lut, entry_internal);
 		frontier.push({entry_dist, entry_internal});
@@ -214,13 +214,13 @@ vector<AiSaqCore::Candidate> AiSaqCore::BeamSearch(const float *query_lut, idx_t
 		const uint16_t n = GetNeighborCount(nref.ptr);
 		for (uint16_t i = 0; i < n; i++) {
 			const uint32_t nb_internal = GetNeighbor(nref.ptr, i);
-			if (nb_internal >= tls_.visit_marks.size()) {
-				tls_.visit_marks.resize(std::max<size_t>(tls_.visit_marks.size() * 2, size_t(nb_internal) + 1), 0);
+			if (nb_internal >= tls.visit_marks.size()) {
+				tls.visit_marks.resize(std::max<size_t>(tls.visit_marks.size() * 2, size_t(nb_internal) + 1), 0);
 			}
-			if (tls_.visit_marks[nb_internal] == vc) {
+			if (tls.visit_marks[nb_internal] == vc) {
 				continue;
 			}
-			tls_.visit_marks[nb_internal] = vc;
+			tls.visit_marks[nb_internal] = vc;
 
 			// Label filtering: skip neighbors whose label doesn't match.
 			if (label_filter && label_filter->IsActive()) {
@@ -245,7 +245,7 @@ vector<AiSaqCore::Candidate> AiSaqCore::BeamSearch(const float *query_lut, idx_t
 				}
 			}
 		}
-		// nref handle released here → block eligible for eviction.
+		// nref handle released here -> block eligible for eviction.
 	}
 
 	out.reserve(W.size());
@@ -302,7 +302,7 @@ float AiSaqCore::RawDistance(const float *a, const float *b) const {
 // ---------------------------------------------------------------------------
 
 vector<AiSaqCore::Candidate> AiSaqCore::RobustPrune(const float * /*query_lut*/, vector<Candidate> candidates, idx_t R,
-                                                    float alpha) const {
+                                                    float alpha, vamana::VamanaTLS &tls) const {
 	std::sort(candidates.begin(), candidates.end(),
 	          [](const Candidate &a, const Candidate &b) { return a.distance < b.distance; });
 	const idx_t n = candidates.size();
@@ -311,15 +311,14 @@ vector<AiSaqCore::Candidate> AiSaqCore::RobustPrune(const float * /*query_lut*/,
 	}
 
 	// Tier 1: gather all candidate PQ codes into a flat local buffer.
-	// O(n) Pin calls instead of O(n²) from per-pair ReadPqCode.
+	// O(n) Pin calls instead of O(n^2) from per-pair ReadPqCode.
 	// Tier 2/3: CodeDistance uses flat buffers directly, no gather needed.
-	vector<uint8_t> local_codes;
 	const bool need_gather = !build_codes_ && !build_vectors_;
 	if (need_gather) {
-		tls_.prune_scratch.resize(n * code_size_);
+		tls.prune_scratch.resize(n * code_size_);
 		for (idx_t i = 0; i < n; i++) {
 			auto ref = ReadPqCode(uint32_t(candidates[i].row_id));
-			std::memcpy(tls_.prune_scratch.data() + i * code_size_, ref.ptr, code_size_);
+			std::memcpy(tls.prune_scratch.data() + i * code_size_, ref.ptr, code_size_);
 		}
 	}
 
@@ -339,8 +338,8 @@ vector<AiSaqCore::Candidate> AiSaqCore::RobustPrune(const float * /*query_lut*/,
 			}
 			float d_pp;
 			if (need_gather) {
-				d_pp = quantizer_.CodeDistance(tls_.prune_scratch.data() + p_idx * code_size_,
-				                               tls_.prune_scratch.data() + pp_idx * code_size_);
+				d_pp = quantizer_.CodeDistance(tls.prune_scratch.data() + p_idx * code_size_,
+				                               tls.prune_scratch.data() + pp_idx * code_size_);
 			} else {
 				d_pp = CodeDistance(uint32_t(candidates[p_idx].row_id), uint32_t(candidates[pp_idx].row_id));
 			}
@@ -356,8 +355,10 @@ vector<AiSaqCore::Candidate> AiSaqCore::RobustPrune(const float * /*query_lut*/,
 // ConnectAndPrune
 // ---------------------------------------------------------------------------
 
-void AiSaqCore::ConnectAndPrune(uint32_t new_internal_id, const float *new_lut, const vector<Candidate> &selected) {
-	// Forward edges on the new node.
+void AiSaqCore::ConnectAndPrune(uint32_t new_internal_id, const float *new_lut, const vector<Candidate> &selected,
+                                vamana::VamanaTLS &tls, vector<DeferredReciprocal> &deferred) {
+	// Forward edges on the new node — safe by construction: each new_internal_id
+	// is exclusive to one task, so the write is race-free.
 	{
 		auto nref = PinNode(new_internal_id);
 		const uint16_t cnt = uint16_t(std::min<idx_t>(selected.size(), params_.R));
@@ -367,9 +368,38 @@ void AiSaqCore::ConnectAndPrune(uint32_t new_internal_id, const float *new_lut, 
 		}
 	}
 
-	// Reciprocal edges.
+	// Reciprocal edges: deferred. Each task accumulates these and the build
+	// event's serial ApplyDeferredReciprocals post-pass applies them. Reading
+	// the target's neighbor list + writing back would race across tasks
+	// otherwise (two tasks could both see count=R-1 and both append, losing
+	// an update).
+	//
+	// Note: we don't snapshot new_lut (the LUT parameter to RobustPrune is
+	// explicitly unused — re-prune distances come from CodeDistance, not the
+	// LUT; see DeferredReciprocal's class comment for the full justification).
+	(void)new_lut;
+	deferred.reserve(deferred.size() + selected.size());
 	for (const auto &s : selected) {
-		const uint32_t s_internal = uint32_t(s.row_id);
+		deferred.push_back({uint32_t(s.row_id), new_internal_id});
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ApplyDeferredReciprocals — serial post-pass that drains the merged
+// per-task deferred list. Body mirrors the old ConnectAndPrune reciprocal
+// loop (lines 319-366 in the pre-Task-5 source) bit-for-bit: pin target,
+// append if room, else re-prune. The only difference is timing — these
+// back-edges used to be applied inside each Insert; now they're applied
+// once at the end of all parallel inserts.
+//
+// Caller (AiSaqIndex::FinalizeParallelConstruct) holds the rwlock. Uses
+// `tls_` for any overflow re-prune work — single-threaded here.
+// ---------------------------------------------------------------------------
+
+void AiSaqCore::ApplyDeferredReciprocals(const vector<DeferredReciprocal> &all_deferred) {
+	for (const auto &d : all_deferred) {
+		const uint32_t s_internal = d.target_internal_id;
+		const uint32_t new_internal_id = d.new_internal_id;
 		auto sref = PinNode(s_internal);
 		uint16_t cnt = GetNeighborCount(sref.ptr);
 		if (cnt < params_.R) {
@@ -379,28 +409,28 @@ void AiSaqCore::ConnectAndPrune(uint32_t new_internal_id, const float *new_lut, 
 		}
 		// Overflow: re-prune s's neighbor set.
 		// Tier 1 optimization: gather s + new + all neighbor codes into a
-		// local buffer to avoid O(R²) per-pair Pin calls.
-		vector<uint8_t> local_codes;
+		// local buffer to avoid O(R^2) per-pair Pin calls.
 		const bool need_gather = !build_codes_ && !build_vectors_;
 		if (need_gather) {
 			// Layout: [0]=s_internal, [1]=new_internal_id, [2..cnt+1]=neighbors
-			local_codes.resize((idx_t(cnt) + 2) * code_size_);
-			CopyBuildCode(s_internal, local_codes.data());
-			CopyBuildCode(new_internal_id, local_codes.data() + code_size_);
+			tls_.prune_scratch.resize((idx_t(cnt) + 2) * code_size_);
+			CopyBuildCode(s_internal, tls_.prune_scratch.data());
+			CopyBuildCode(new_internal_id, tls_.prune_scratch.data() + code_size_);
 			for (uint16_t i = 0; i < cnt; i++) {
 				const uint32_t nb = GetNeighbor(sref.ptr, i);
-				CopyBuildCode(nb, local_codes.data() + idx_t(i + 2) * code_size_);
+				CopyBuildCode(nb, tls_.prune_scratch.data() + idx_t(i + 2) * code_size_);
 			}
 		}
 
 		vector<Candidate> cand;
 		cand.reserve(idx_t(cnt) + 1);
 		if (need_gather) {
-			const_data_ptr_t s_ptr = local_codes.data();
-			cand.push_back({int64_t(new_internal_id), quantizer_.CodeDistance(s_ptr, local_codes.data() + code_size_)});
+			const_data_ptr_t s_ptr = tls_.prune_scratch.data();
+			cand.push_back(
+			    {int64_t(new_internal_id), quantizer_.CodeDistance(s_ptr, tls_.prune_scratch.data() + code_size_)});
 			for (uint16_t i = 0; i < cnt; i++) {
 				cand.push_back({int64_t(GetNeighbor(sref.ptr, i)),
-				                quantizer_.CodeDistance(s_ptr, local_codes.data() + idx_t(i + 2) * code_size_)});
+				                quantizer_.CodeDistance(s_ptr, tls_.prune_scratch.data() + idx_t(i + 2) * code_size_)});
 			}
 		} else {
 			cand.push_back({int64_t(new_internal_id), CodeDistance(s_internal, new_internal_id)});
@@ -409,11 +439,22 @@ void AiSaqCore::ConnectAndPrune(uint32_t new_internal_id, const float *new_lut, 
 				cand.push_back({int64_t(nb), CodeDistance(s_internal, nb)});
 			}
 		}
-		auto kept = RobustPrune(new_lut, std::move(cand), params_.R, params_.alpha);
+		auto kept = RobustPrune(nullptr, std::move(cand), params_.R, params_.alpha, tls_);
 		SetNeighborCount(sref.ptr, uint16_t(kept.size()));
 		for (idx_t i = 0; i < kept.size(); i++) {
 			SetNeighbor(sref.ptr, i, uint32_t(kept[i].row_id));
 		}
+	}
+}
+
+void AiSaqCore::MergeLabelMaps(const unordered_map<uint32_t, int64_t> &id2label,
+                               const unordered_map<int64_t, vector<uint32_t>> &label2ids) {
+	for (const auto &kv : id2label) {
+		internal_id_to_label_[kv.first] = kv.second;
+	}
+	for (const auto &kv : label2ids) {
+		auto &target = label_to_internal_ids_[kv.first];
+		target.insert(target.end(), kv.second.begin(), kv.second.end());
 	}
 }
 
@@ -422,8 +463,29 @@ void AiSaqCore::ConnectAndPrune(uint32_t new_internal_id, const float *new_lut, 
 // ---------------------------------------------------------------------------
 
 uint32_t AiSaqCore::Insert(int64_t row_id, const float *vec, int64_t label) {
+	// Serial / test path. Allocates the internal_id via the block store
+	// (per-call), runs the insert with the core's own tls_, and synchronously
+	// applies the deferred reciprocals — preserving the old immediate-back-edge
+	// semantics bit-for-bit. The parallel build path uses InsertBuild instead
+	// and batches the reciprocity apply at the end.
 	const uint32_t internal_id = store_.AllocGraphNode();
+	vector<DeferredReciprocal> local_deferred;
+	const uint32_t prev_size = size_;
+	InsertBuild(internal_id, row_id, vec, label, tls_, local_deferred, internal_id_to_label_, label_to_internal_ids_);
+	// InsertBuild's first-call branch (size_==0) sets size_=1 itself; for
+	// every subsequent call it leaves size_ untouched (parallel path owns
+	// the final SetSize). Bump here for non-first serial inserts.
+	if (prev_size > 0) {
+		size_++;
+	}
+	ApplyDeferredReciprocals(local_deferred);
+	return internal_id;
+}
 
+uint32_t AiSaqCore::InsertBuild(uint32_t internal_id, int64_t row_id, const float *vec, int64_t label,
+                                vamana::VamanaTLS &tls, vector<DeferredReciprocal> &deferred,
+                                unordered_map<uint32_t, int64_t> &local_id2label,
+                                unordered_map<int64_t, vector<uint32_t>> &local_label2ids) {
 	{
 		auto nref = PinNode(internal_id);
 		// Zero the fixed header + neighbor array (the inline PQ region, if
@@ -435,16 +497,24 @@ uint32_t AiSaqCore::Insert(int64_t row_id, const float *vec, int64_t label) {
 		SetInlinePqCount(nref.ptr, params_.inline_pq_count);
 	}
 
-	if (internal_id >= tls_.visit_marks.size()) {
-		tls_.visit_marks.resize(std::max<size_t>(tls_.visit_marks.size() * 2, size_t(internal_id) + 1), 0);
+	if (internal_id >= tls.visit_marks.size()) {
+		tls.visit_marks.resize(std::max<size_t>(tls.visit_marks.size() * 2, size_t(internal_id) + 1), 0);
 	}
 
-	// Label bookkeeping.
+	// Per-task label bookkeeping (merged serially into the core's global
+	// maps after all tasks finish). BeamSearch during build never reads
+	// label maps (label_filter is null at build time), so per-task isolation
+	// is safe.
 	if (label != INT64_MIN) {
-		internal_id_to_label_[internal_id] = label;
-		label_to_internal_ids_[label].push_back(internal_id);
+		local_id2label[internal_id] = label;
+		local_label2ids[label].push_back(internal_id);
 	}
 
+	// First-insert claim of the entry point. The parallel coordinator MUST
+	// serialize the first InsertBuild across all tasks (typically by running
+	// it once in Schedule() before spawning tasks). Concurrent first-calls
+	// would race on entry_internal_ / size_. Subsequent calls are safe to
+	// run concurrently on disjoint internal_id ranges.
 	if (size_ == 0) {
 		entry_internal_ = internal_id;
 		size_ = 1;
@@ -458,18 +528,15 @@ uint32_t AiSaqCore::Insert(int64_t row_id, const float *vec, int64_t label) {
 	if (quantizer_.LUTSize() > 0) {
 		quantizer_.PopulateDistanceLUT(qpre.data(), lut.data());
 	} else {
-		// Fallback (shouldn't happen: AiSAQ requires PQ/ScaNN). Use the
-		// preprocessed query directly as the "LUT" — EstimateDistance-path
-		// quantizers are rejected at the index layer.
+		// Fallback (shouldn't happen: AiSAQ requires PQ/ScaNN).
 		std::memcpy(lut.data(), qpre.data(), qpre.size() * sizeof(float));
 	}
 
 	const idx_t L_build = params_.L_build > 0 ? params_.L_build : params_.R;
-	auto cands = BeamSearch(lut.data(), L_build, 0);
-	auto selected = RobustPrune(lut.data(), std::move(cands), params_.R, params_.alpha);
-	ConnectAndPrune(internal_id, lut.data(), selected);
+	auto cands = BeamSearch(lut.data(), L_build, 0, tls);
+	auto selected = RobustPrune(lut.data(), std::move(cands), params_.R, params_.alpha, tls);
+	ConnectAndPrune(internal_id, lut.data(), selected, tls, deferred);
 
-	size_++;
 	return internal_id;
 }
 
@@ -700,21 +767,21 @@ vector<AiSaqCore::Candidate> AiSaqCore::Search(const float *query_lut, idx_t k, 
 			return {}; // no vectors with this label
 		}
 		vector<uint32_t> ep = {it->second};
-		cands = BeamSearch(query_lut, L_search, io_limit, &ep, lf);
+		cands = BeamSearch(query_lut, L_search, io_limit, tls_, &ep, lf);
 	} else if (lf && lf->kind == LabelFilter::Kind::RANGE) {
 		// RANGE: adaptive strategy.
 		const idx_t match_count = CountLabelsInRange(lf->lo, lf->hi);
 		if (match_count > 0 && match_count <= params_.n_entry_points) {
 			// Multi-medoid: use all matching medoids as entry points.
 			auto eps = GetMedoidsInRange(lf->lo, lf->hi, params_.n_entry_points);
-			cands = BeamSearch(query_lut, L_search, io_limit, &eps, lf);
+			cands = BeamSearch(query_lut, L_search, io_limit, tls_, &eps, lf);
 		} else {
 			// Too many labels or none: fall back to global entry points.
-			cands = BeamSearch(query_lut, L_search, io_limit, nullptr, lf);
+			cands = BeamSearch(query_lut, L_search, io_limit, tls_, nullptr, lf);
 		}
 	} else {
 		// No label filter or unsupported kind: normal search.
-		cands = BeamSearch(query_lut, L_search, io_limit, nullptr, lf);
+		cands = BeamSearch(query_lut, L_search, io_limit, tls_, nullptr, lf);
 	}
 
 	if (cands.size() > k) {

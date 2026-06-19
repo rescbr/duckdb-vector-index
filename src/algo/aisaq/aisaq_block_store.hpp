@@ -41,6 +41,15 @@ class AiSaqBlockStore {
 	// prior PreAllocateGraphCapacity/EnsureGraphCapacity(N) call sizes the
 	// block vectors once so the per-call path is a no-op (vector reads only).
 
+	uint32_t AllocGraphNodeRange(uint32_t count);
+	// Reserves `count` contiguous internal_ids in one atomic step and returns
+	// the start of the range (the prior counter value). Used by Phase 9 Task
+	// 5's parallel construct path: the build event pre-reserves [0, N) once
+	// so per-task InsertBuild calls can use internal_id = row_ordinal
+	// deterministically (preserving the internal_id <-> PQ-slot mapping)
+	// without per-row atomics. When `count` is 0, returns the current counter
+	// value without mutation.
+
 	void SetFlatBuildMode(bool enabled) {
 		flat_build_mode_.store(enabled, std::memory_order_relaxed);
 	}

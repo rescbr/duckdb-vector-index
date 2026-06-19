@@ -50,6 +50,32 @@ struct AiSaqCoreParams {
 	uint64_t seed = 0xA15A6ULL;
 };
 
+// ---------------------------------------------------------------------------
+// DeferredReciprocal — queued back-edge from a parallel-construct insert.
+//
+// During Phase 9 Task 5 parallel construction, each task runs Vamana inserts
+// on a disjoint row range. Forward edges (new node -> selected neighbors) are
+// written immediately — safe by construction (each new_internal_id is exclusive
+// to one task). Reciprocal edges (selected neighbor -> new node) would race on
+// the target's neighbor list, so they are deferred: each task appends one of
+// these per selected neighbor, and a serial post-pass (ApplyDeferredReciprocals)
+// applies them all under the rwlock.
+//
+// Deviation from the original Phase 9 plan: the plan also called for a
+// `vector<float> new_lut_snapshot` to support re-pruning via RobustPrune.
+// Inspection of RobustPrune (`aisaq_core.cpp:304`) shows the LUT parameter is
+// explicitly unused (`const float * /*query_lut*/`) — re-prune distances come
+// from CodeDistance / the candidate vector's precomputed distance field, NOT
+// the LUT. Carrying a per-entry LUT copy would cost N*R*LUTSize*sizeof(float)
+// extra RAM (32+ GB on sift1m + ScaNN), so the snapshot is dropped. Re-prune
+// in ApplyDeferredReciprocals passes a nullptr LUT, matching the no-op
+// RobustPrune path.
+// ---------------------------------------------------------------------------
+struct DeferredReciprocal {
+	uint32_t target_internal_id = 0; // node whose neighbor list should grow
+	uint32_t new_internal_id = 0;    // the just-inserted node to add as a back-edge
+};
+
 class AiSaqCore {
   public:
 	AiSaqCore(AiSaqCoreParams params, Quantizer &quantizer, AiSaqBlockStore &store);
@@ -59,10 +85,61 @@ class AiSaqCore {
 		float distance;
 	};
 
-	// Vamana online insert. The PQ code for this internal_id must already be
-	// present in the block store (written by the PQ encoding pass). Returns
-	// the allocated internal_id. label = INT64_MIN means "no label".
+	// Vamana online insert (serial / test path). The PQ code for this
+	// internal_id must already be present in the block store (written by the
+	// PQ encoding pass). Returns the allocated internal_id.
+	// label = INT64_MIN means "no label". Uses the core's own `tls_` member
+	// and the global label maps — single-threaded only. For the parallel
+	// build path, use InsertBuild.
 	uint32_t Insert(int64_t row_id, const float *vec, int64_t label = INT64_MIN);
+
+	// Vamana online insert with explicit per-thread state (Phase 9 Task 5
+	// parallel build path). The caller supplies:
+	//   - internal_id: must equal the row's PQ slot index (Pass 1 wrote the
+	//     code there). Allocation is the caller's responsibility — typically
+	//     the build event pre-reserves [0, N) via AllocGraphNodeRange so
+	//     internal_id = row_ordinal deterministically.
+	//   - tls: per-thread VamanaTLS scratch. Must outlive the call.
+	//   - deferred: per-task accumulator for reciprocal edges. The caller
+	//     merges these across tasks and passes the merged list to
+	//     ApplyDeferredReciprocals after all tasks finish.
+	//   - local_id2label / local_label2ids: per-task label maps. Merged into
+	//     the core's global maps serially by the caller; BeamSearch during
+	//     build never reads label maps (label_filter is null), so per-task
+	//     isolation is sound.
+	//
+	// The FIRST call (size_ == 0) claims the entry point. The caller must
+	// serialize the first InsertBuild across all tasks (typically the build
+	// event runs it in Schedule() before spawning tasks) — concurrent first
+	// calls would race on entry_internal_ / size_. Subsequent calls are
+	// safe to run concurrently across tasks on disjoint internal_id ranges.
+	// Does NOT bump size_ — the caller sets size_ = N at the end.
+	uint32_t InsertBuild(uint32_t internal_id, int64_t row_id, const float *vec, int64_t label, vamana::VamanaTLS &tls,
+	                     vector<DeferredReciprocal> &deferred, unordered_map<uint32_t, int64_t> &local_id2label,
+	                     unordered_map<int64_t, vector<uint32_t>> &local_label2ids);
+
+	// Apply queued reciprocal edges serially. Must be called after all
+	// parallel InsertBuild tasks finish and the deferred lists are merged.
+	// Mutates graph state — caller must hold the rwlock. Uses `tls_` for any
+	// overflow re-prune work (single-threaded here).
+	//
+	// The merged list is sorted by new_internal_id before application so the
+	// output is deterministic regardless of thread scheduling — this gives
+	// reproducible graph topology + recall across runs on the same input.
+	void ApplyDeferredReciprocals(const vector<DeferredReciprocal> &all_deferred);
+
+	// Merge per-task label maps into the core's global maps. Called serially
+	// from the build event's FinishEvent after all construct tasks finish.
+	// Safe to call multiple times (e.g., once per task's local maps).
+	void MergeLabelMaps(const unordered_map<uint32_t, int64_t> &id2label,
+	                    const unordered_map<int64_t, vector<uint32_t>> &label2ids);
+
+	// Set the final node count after parallel construction. Tasks don't bump
+	// size_ during InsertBuild (that would race); the build event sets it
+	// once after all tasks finish + deferred reciprocity is applied.
+	void SetSize(uint32_t size) {
+		size_ = size;
+	}
 
 	// Paged-PQ approximate kNN. `query_lut` is a pre-populated LUT
 	// (Quantizer::PopulateDistanceLUT). L_search overrides params_.L when > 0.
@@ -305,13 +382,22 @@ class AiSaqCore {
 	// forced_entry_points: when non-null and non-empty, use these as start
 	// points instead of PickEntryPoint (for label-mediated multi-start).
 	// label_filter: when non-null, skip neighbors whose label doesn't match.
-	vector<Candidate> BeamSearch(const float *query_lut, idx_t L, idx_t io_limit,
+	//
+	// `tls` is per-thread scratch (visit marks + epoch). Single-threaded
+	// callers pass `tls_` (the core member); parallel build-path callers
+	// pass their own per-task VamanaTLS&.
+	vector<Candidate> BeamSearch(const float *query_lut, idx_t L, idx_t io_limit, vamana::VamanaTLS &tls,
 	                             const vector<uint32_t> *forced_entry_points = nullptr,
 	                             const LabelFilter *label_filter = nullptr) const;
 
-	vector<Candidate> RobustPrune(const float *query_lut, vector<Candidate> candidates, idx_t R, float alpha) const;
+	vector<Candidate> RobustPrune(const float *query_lut, vector<Candidate> candidates, idx_t R, float alpha,
+	                              vamana::VamanaTLS &tls) const;
 
-	void ConnectAndPrune(uint32_t new_internal_id, const float *new_lut, const vector<Candidate> &selected);
+	// Write forward edges (new_internal_id -> each selected neighbor) and
+	// queue reciprocal edges onto `deferred`. The caller merges `deferred`
+	// across tasks and applies them serially via ApplyDeferredReciprocals.
+	void ConnectAndPrune(uint32_t new_internal_id, const float *new_lut, const vector<Candidate> &selected,
+	                     vamana::VamanaTLS &tls, vector<DeferredReciprocal> &deferred);
 
 	AiSaqCoreParams params_;
 	Quantizer &quantizer_;
@@ -348,8 +434,13 @@ class AiSaqCore {
 
 	// Per-call Vamana scratch (visit-mark table, prune gather buffer, RNG).
 	// Marked mutable because BeamSearch / RobustPrune are const but bump the
-	// epoch and reuse the scratch. In Task 5 this is lifted to a per-thread
-	// parameter to make concurrent primitives safe by construction.
+	// epoch and reuse the scratch. Used by:
+	//   - Search() — public query path, single-threaded per call.
+	//   - Insert() — public serial test path; passes tls_ into InsertBuild.
+	//   - ApplyDeferredReciprocals() — serial post-pass; uses tls_ for the
+	//     overflow re-prune work.
+	// The parallel build path (InsertBuild) does NOT touch this member —
+	// each task owns its own VamanaTLS and passes it in explicitly.
 	mutable vamana::VamanaTLS tls_;
 
 	// Database instance for TaskScheduler access. When null, the post-build

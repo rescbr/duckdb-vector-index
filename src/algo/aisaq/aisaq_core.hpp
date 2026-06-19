@@ -12,9 +12,11 @@
 #include "vindex/unaligned.hpp"
 #include "vindex/vamana.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <random>
+#include <thread>
 
 namespace duckdb {
 class DatabaseInstance;
@@ -51,29 +53,64 @@ struct AiSaqCoreParams {
 };
 
 // ---------------------------------------------------------------------------
-// DeferredReciprocal — queued back-edge from a parallel-construct insert.
+// NodeSpinlock — per-node spinlock for parallel ConnectAndPrune (Phase 9
+// Task 5.5).
 //
-// During Phase 9 Task 5 parallel construction, each task runs Vamana inserts
-// on a disjoint row range. Forward edges (new node -> selected neighbors) are
-// written immediately — safe by construction (each new_internal_id is exclusive
-// to one task). Reciprocal edges (selected neighbor -> new node) would race on
-// the target's neighbor list, so they are deferred: each task appends one of
-// these per selected neighbor, and a serial post-pass (ApplyDeferredReciprocals)
-// applies them all under the rwlock.
+// Phase 9 Task 5's deferred-reciprocity + global rwlock strategy capped CPU
+// at ~250% on a 10-core host because every periodic apply serialized through
+// one global lock. Task 5.5 replaces it with per-node spinlocks: each task
+// acquires the target node's lock individually when writing the back-edge to
+// that node's neighbor list, while the forward-edge write to the new node is
+// lock-free (each new_internal_id is exclusive to one task). No global lock
+// is held on the parallel insert path; the only serialization left is the
+// per-node critical section, which is sub-microsecond.
 //
-// Deviation from the original Phase 9 plan: the plan also called for a
-// `vector<float> new_lut_snapshot` to support re-pruning via RobustPrune.
-// Inspection of RobustPrune (`aisaq_core.cpp:304`) shows the LUT parameter is
-// explicitly unused (`const float * /*query_lut*/`) — re-prune distances come
-// from CodeDistance / the candidate vector's precomputed distance field, NOT
-// the LUT. Carrying a per-entry LUT copy would cost N*R*LUTSize*sizeof(float)
-// extra RAM (32+ GB on sift1m + ScaNN), so the snapshot is dropped. Re-prune
-// in ApplyDeferredReciprocals passes a nullptr LUT, matching the no-op
-// RobustPrune path.
+// Spinlock (not std::mutex): the critical section is append-or-re-prune of a
+// ≤R-neighbor list. std::mutex would syscall on every acquisition; PAUSE
+// (x86) / yield (arm64) keeps the contended thread on-core. Same pattern as
+// hnswlib (`link_list_locks_`, hnswalg.h:3142) and DiskANN (`inter_insert`,
+// index_build.cpp) — both production Vamana/HNSW implementations.
+//
+// 4 bytes per node → 4 MB for sift1m. Stored in AiSaqCore::node_locks_,
+// separate from build_nodes_ (which evicts via BufferManager in paged mode)
+// so lock storage has a stable address across the build.
+//
+// TTAS (test-and-test-and-set) pattern: the spinning thread reloads the flag
+// with relaxed ordering before each CAS retry, so it doesn't re-dirty the
+// cache line on every iteration. The CAS itself uses acquire-on-success /
+// relaxed-on-failure; unlock uses release. This guarantees that everything
+// done inside the critical section is visible to the next acquirer.
+//
+// Deadlock safety: at most ONE lock is held at a time per task (the loop in
+// ConnectAndPrune acquires, writes, releases per neighbor). With no nested
+// lock acquisition, deadlock is impossible regardless of acquisition order.
 // ---------------------------------------------------------------------------
-struct DeferredReciprocal {
-	uint32_t target_internal_id = 0; // node whose neighbor list should grow
-	uint32_t new_internal_id = 0;    // the just-inserted node to add as a back-edge
+struct NodeSpinlock {
+	std::atomic<uint32_t> flag{0};
+
+	void lock() {
+		for (;;) {
+			uint32_t expected = 0;
+			if (flag.compare_exchange_weak(expected, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+				return;
+			}
+			// Spin-wait for the holder to release before retrying, to reduce
+			// cache-line bouncing under contention.
+			while (flag.load(std::memory_order_relaxed) != 0) {
+#if defined(__x86_64__) || defined(__i386__)
+				__builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+				__builtin_arm_yield();
+#else
+				std::this_thread::yield();
+#endif
+			}
+		}
+	}
+
+	void unlock() {
+		flag.store(0, std::memory_order_release);
+	}
 };
 
 class AiSaqCore {
@@ -100,9 +137,6 @@ class AiSaqCore {
 	//     the build event pre-reserves [0, N) via AllocGraphNodeRange so
 	//     internal_id = row_ordinal deterministically.
 	//   - tls: per-thread VamanaTLS scratch. Must outlive the call.
-	//   - deferred: per-task accumulator for reciprocal edges. The caller
-	//     merges these across tasks and passes the merged list to
-	//     ApplyDeferredReciprocals after all tasks finish.
 	//   - local_id2label / local_label2ids: per-task label maps. Merged into
 	//     the core's global maps serially by the caller; BeamSearch during
 	//     build never reads label maps (label_filter is null), so per-task
@@ -114,19 +148,13 @@ class AiSaqCore {
 	// calls would race on entry_internal_ / size_. Subsequent calls are
 	// safe to run concurrently across tasks on disjoint internal_id ranges.
 	// Does NOT bump size_ — the caller sets size_ = N at the end.
-	uint32_t InsertBuild(uint32_t internal_id, int64_t row_id, const float *vec, int64_t label, vamana::VamanaTLS &tls,
-	                     vector<DeferredReciprocal> &deferred, unordered_map<uint32_t, int64_t> &local_id2label,
-	                     unordered_map<int64_t, vector<uint32_t>> &local_label2ids);
-
-	// Apply queued reciprocal edges serially. Must be called after all
-	// parallel InsertBuild tasks finish and the deferred lists are merged.
-	// Mutates graph state — caller must hold the rwlock. Uses `tls_` for any
-	// overflow re-prune work (single-threaded here).
 	//
-	// The merged list is sorted by new_internal_id before application so the
-	// output is deterministic regardless of thread scheduling — this gives
-	// reproducible graph topology + recall across runs on the same input.
-	void ApplyDeferredReciprocals(const vector<DeferredReciprocal> &all_deferred);
+	// Reciprocal edges are applied inline via per-node spinlocks in
+	// ConnectAndPrune (Phase 9 Task 5.5). The caller MUST have pre-sized
+	// node_locks_ to N via ResizeNodeLocks before spawning tasks.
+	uint32_t InsertBuild(uint32_t internal_id, int64_t row_id, const float *vec, int64_t label, vamana::VamanaTLS &tls,
+	                     unordered_map<uint32_t, int64_t> &local_id2label,
+	                     unordered_map<int64_t, vector<uint32_t>> &local_label2ids);
 
 	// Merge per-task label maps into the core's global maps. Called serially
 	// from the build event's FinishEvent after all construct tasks finish.
@@ -238,6 +266,17 @@ class AiSaqCore {
 	void PrepareForBuild(idx_t estimated_count) {
 		tls_.PrepareForBuild(estimated_count);
 	}
+
+	// Pre-size the per-node spinlock array. MUST be called once,
+	// single-threaded, before any parallel InsertBuild task spawns (the
+	// parallel build path in aisaq_build.cpp calls this from Schedule()). The
+	// array is indexed by internal_id and must not be reallocated while tasks
+	// hold references to its elements.
+	//
+	// Also used by the serial Insert() path to lazily grow the array past the
+	// build-time size for live inserts (no concurrent threads there, so
+	// reallocating is safe).
+	void ResizeNodeLocks(idx_t count);
 
 	// Per-task workers for parallel post-build phases (Phase 9 Task 3).
 	// Public so the AiSaqFinalizeInlineTask / AiSaqComputeMedoidsTask classes
@@ -394,10 +433,12 @@ class AiSaqCore {
 	                              vamana::VamanaTLS &tls) const;
 
 	// Write forward edges (new_internal_id -> each selected neighbor) and
-	// queue reciprocal edges onto `deferred`. The caller merges `deferred`
-	// across tasks and applies them serially via ApplyDeferredReciprocals.
+	// apply reciprocal edges inline. Each target neighbor's per-node spinlock
+	// is acquired individually while its back-edge is appended (or its
+	// neighbor list is re-pruned on overflow). At most one lock is held at a
+	// time per task — deadlock-free.
 	void ConnectAndPrune(uint32_t new_internal_id, const float *new_lut, const vector<Candidate> &selected,
-	                     vamana::VamanaTLS &tls, vector<DeferredReciprocal> &deferred);
+	                     vamana::VamanaTLS &tls);
 
 	AiSaqCoreParams params_;
 	Quantizer &quantizer_;
@@ -437,11 +478,19 @@ class AiSaqCore {
 	// epoch and reuse the scratch. Used by:
 	//   - Search() — public query path, single-threaded per call.
 	//   - Insert() — public serial test path; passes tls_ into InsertBuild.
-	//   - ApplyDeferredReciprocals() — serial post-pass; uses tls_ for the
-	//     overflow re-prune work.
 	// The parallel build path (InsertBuild) does NOT touch this member —
 	// each task owns its own VamanaTLS and passes it in explicitly.
 	mutable vamana::VamanaTLS tls_;
+
+	// Per-node spinlocks for parallel ConnectAndPrune (Phase 9 Task 5.5).
+	// Sized to N before parallel tasks spawn via ResizeNodeLocks(N); grown
+	// lazily by Insert() for the serial live path. Indexed by internal_id.
+	// Stored as unique_ptr<T[]> (not vector<T>) because std::atomic is
+	// non-copyable AND non-movable — vector resize/insert would fail to
+	// compile, while unique_ptr<T[]>.reset(new T[n]) default-constructs in
+	// place via `new T[n]`.
+	unique_ptr<NodeSpinlock[]> node_locks_;
+	idx_t node_locks_count_ = 0;
 
 	// Database instance for TaskScheduler access. When null, the post-build
 	// phases fall back to the serial path (used by unit tests that don't

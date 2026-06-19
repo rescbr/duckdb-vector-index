@@ -352,13 +352,42 @@ vector<AiSaqCore::Candidate> AiSaqCore::RobustPrune(const float * /*query_lut*/,
 }
 
 // ---------------------------------------------------------------------------
-// ConnectAndPrune
+// ConnectAndPrune — per-node spinlock strategy (Phase 9 Task 5.5).
+//
+// Forward edges: written to new_internal_id without a lock. Only one task
+// can be inserting a given new_internal_id (caller contract: tasks run on
+// disjoint internal_id ranges), so the write is race-free.
+//
+// Reciprocal edges: each target's per-node spinlock is acquired individually
+// while we append the back-edge (or re-prune on overflow). At most one lock
+// is held at a time per task — deadlock is impossible without nested lock
+// acquisition, regardless of acquisition order.
+//
+// Critical section: append-or-re-prune of a ≤R-neighbor list, sub-µs. The
+// spinlock keeps the contended thread on-core via PAUSE/yield; this is the
+// same pattern hnswlib and DiskANN use (see NodeSpinlock's class comment).
+//
+// On overflow re-prune, distances come from CodeDistance (Tier 2/3 flat
+// buffer fast path) or a per-prune gather (Tier 1, paged). The LUT
+// parameter to RobustPrune is explicitly unused; new_lut is taken only for
+// API symmetry and discarded.
+//
+// (Concurrency note on BeamSearch reads: BeamSearch reads neighbor lists
+// WITHOUT a lock, so a concurrent ConnectAndPrune write to a node being
+// expanded by another task's search is technically a data race under the
+// C++ memory model. In practice this is benign: the cnt and neighbor[i]
+// fields are uint16_t/uint32_t, and aligned loads/stores of those widths
+// are atomic at the hardware level on every target we ship, so BeamSearch
+// observes either the pre- or post-update view, never a torn value. Vamana
+// search tolerates slightly-stale topology — it's a best-effort greedy
+// traversal. TSan will flag this race; it's a known acceptable one. The
+// alternative — locking during search — would add lock overhead to the
+// build hot path with no recall benefit.)
 // ---------------------------------------------------------------------------
 
-void AiSaqCore::ConnectAndPrune(uint32_t new_internal_id, const float *new_lut, const vector<Candidate> &selected,
-                                vamana::VamanaTLS &tls, vector<DeferredReciprocal> &deferred) {
-	// Forward edges on the new node — safe by construction: each new_internal_id
-	// is exclusive to one task, so the write is race-free.
+void AiSaqCore::ConnectAndPrune(uint32_t new_internal_id, const float * /*new_lut*/, const vector<Candidate> &selected,
+                                vamana::VamanaTLS &tls) {
+	// Forward edges on the new node — race-free (disjoint internal_id per task).
 	{
 		auto nref = PinNode(new_internal_id);
 		const uint16_t cnt = uint16_t(std::min<idx_t>(selected.size(), params_.R));
@@ -368,69 +397,52 @@ void AiSaqCore::ConnectAndPrune(uint32_t new_internal_id, const float *new_lut, 
 		}
 	}
 
-	// Reciprocal edges: deferred. Each task accumulates these and the build
-	// event's serial ApplyDeferredReciprocals post-pass applies them. Reading
-	// the target's neighbor list + writing back would race across tasks
-	// otherwise (two tasks could both see count=R-1 and both append, losing
-	// an update).
-	//
-	// Note: we don't snapshot new_lut (the LUT parameter to RobustPrune is
-	// explicitly unused — re-prune distances come from CodeDistance, not the
-	// LUT; see DeferredReciprocal's class comment for the full justification).
-	(void)new_lut;
-	deferred.reserve(deferred.size() + selected.size());
+	// Reciprocal edges. Each target's lock is acquired and released in
+	// isolation — no nested lock acquisition anywhere in this loop.
 	for (const auto &s : selected) {
-		deferred.push_back({uint32_t(s.row_id), new_internal_id});
-	}
-}
+		const uint32_t s_internal = uint32_t(s.row_id);
+		// Defensive: skip out-of-range targets. node_locks_ is sized to N
+		// by ResizeNodeLocks before tasks spawn; selected row_ids come from
+		// BeamSearch which only visits already-inserted nodes [0, N), so
+		// this branch should never fire in practice.
+		if (s_internal >= node_locks_count_) {
+			continue;
+		}
 
-// ---------------------------------------------------------------------------
-// ApplyDeferredReciprocals — serial post-pass that drains the merged
-// per-task deferred list. Body mirrors the old ConnectAndPrune reciprocal
-// loop (lines 319-366 in the pre-Task-5 source) bit-for-bit: pin target,
-// append if room, else re-prune. The only difference is timing — these
-// back-edges used to be applied inside each Insert; now they're applied
-// once at the end of all parallel inserts.
-//
-// Caller (AiSaqIndex::FinalizeParallelConstruct) holds the rwlock. Uses
-// `tls_` for any overflow re-prune work — single-threaded here.
-// ---------------------------------------------------------------------------
-
-void AiSaqCore::ApplyDeferredReciprocals(const vector<DeferredReciprocal> &all_deferred) {
-	for (const auto &d : all_deferred) {
-		const uint32_t s_internal = d.target_internal_id;
-		const uint32_t new_internal_id = d.new_internal_id;
+		auto &lock = node_locks_[s_internal];
+		lock.lock();
 		auto sref = PinNode(s_internal);
 		uint16_t cnt = GetNeighborCount(sref.ptr);
 		if (cnt < params_.R) {
+			// Common case: room left in s's neighbor list. Append.
 			SetNeighbor(sref.ptr, cnt, new_internal_id);
 			SetNeighborCount(sref.ptr, cnt + 1);
+			lock.unlock();
 			continue;
 		}
-		// Overflow: re-prune s's neighbor set.
-		// Tier 1 optimization: gather s + new + all neighbor codes into a
-		// local buffer to avoid O(R^2) per-pair Pin calls.
+		// Overflow: re-prune s's neighbor list. The body mirrors the old
+		// ApplyDeferredReciprocals re-prune path bit-for-bit.
 		const bool need_gather = !build_codes_ && !build_vectors_;
 		if (need_gather) {
 			// Layout: [0]=s_internal, [1]=new_internal_id, [2..cnt+1]=neighbors
-			tls_.prune_scratch.resize((idx_t(cnt) + 2) * code_size_);
-			CopyBuildCode(s_internal, tls_.prune_scratch.data());
-			CopyBuildCode(new_internal_id, tls_.prune_scratch.data() + code_size_);
+			tls.prune_scratch.resize((idx_t(cnt) + 2) * code_size_);
+			CopyBuildCode(s_internal, tls.prune_scratch.data());
+			CopyBuildCode(new_internal_id, tls.prune_scratch.data() + code_size_);
 			for (uint16_t i = 0; i < cnt; i++) {
 				const uint32_t nb = GetNeighbor(sref.ptr, i);
-				CopyBuildCode(nb, tls_.prune_scratch.data() + idx_t(i + 2) * code_size_);
+				CopyBuildCode(nb, tls.prune_scratch.data() + idx_t(i + 2) * code_size_);
 			}
 		}
 
 		vector<Candidate> cand;
 		cand.reserve(idx_t(cnt) + 1);
 		if (need_gather) {
-			const_data_ptr_t s_ptr = tls_.prune_scratch.data();
+			const_data_ptr_t s_ptr = tls.prune_scratch.data();
 			cand.push_back(
-			    {int64_t(new_internal_id), quantizer_.CodeDistance(s_ptr, tls_.prune_scratch.data() + code_size_)});
+			    {int64_t(new_internal_id), quantizer_.CodeDistance(s_ptr, tls.prune_scratch.data() + code_size_)});
 			for (uint16_t i = 0; i < cnt; i++) {
 				cand.push_back({int64_t(GetNeighbor(sref.ptr, i)),
-				                quantizer_.CodeDistance(s_ptr, tls_.prune_scratch.data() + idx_t(i + 2) * code_size_)});
+				                quantizer_.CodeDistance(s_ptr, tls.prune_scratch.data() + idx_t(i + 2) * code_size_)});
 			}
 		} else {
 			cand.push_back({int64_t(new_internal_id), CodeDistance(s_internal, new_internal_id)});
@@ -439,12 +451,36 @@ void AiSaqCore::ApplyDeferredReciprocals(const vector<DeferredReciprocal> &all_d
 				cand.push_back({int64_t(nb), CodeDistance(s_internal, nb)});
 			}
 		}
-		auto kept = RobustPrune(nullptr, std::move(cand), params_.R, params_.alpha, tls_);
+		auto kept = RobustPrune(nullptr, std::move(cand), params_.R, params_.alpha, tls);
 		SetNeighborCount(sref.ptr, uint16_t(kept.size()));
 		for (idx_t i = 0; i < kept.size(); i++) {
 			SetNeighbor(sref.ptr, i, uint32_t(kept[i].row_id));
 		}
+		lock.unlock();
 	}
+}
+
+void AiSaqCore::ResizeNodeLocks(idx_t count) {
+	if (count <= node_locks_count_) {
+		return;
+	}
+	// Amortized doubling keeps the serial live-insert path O(1) amortized
+	// per call; the parallel build calls this once with the exact N before
+	// tasks spawn, so the doubling never kicks in for it.
+	idx_t new_count = std::max<idx_t>(count, node_locks_count_ * 2);
+	if (new_count < 64) {
+		new_count = 64;
+	}
+	// `new NodeSpinlock[new_count]` default-initializes each element: the
+	// implicit default ctor runs, applying the NSDMI `flag{0}` initializer,
+	// so every lock starts in the unlocked state.
+	//
+	// MUST be called only from single-threaded context. Reallocating while
+	// a parallel build is in flight would dangle per-task references into
+	// the old array — see the caller contract on ResizeNodeLocks in the
+	// header.
+	node_locks_.reset(new NodeSpinlock[new_count]);
+	node_locks_count_ = new_count;
 }
 
 void AiSaqCore::MergeLabelMaps(const unordered_map<uint32_t, int64_t> &id2label,
@@ -464,27 +500,26 @@ void AiSaqCore::MergeLabelMaps(const unordered_map<uint32_t, int64_t> &id2label,
 
 uint32_t AiSaqCore::Insert(int64_t row_id, const float *vec, int64_t label) {
 	// Serial / test path. Allocates the internal_id via the block store
-	// (per-call), runs the insert with the core's own tls_, and synchronously
-	// applies the deferred reciprocals — preserving the old immediate-back-edge
-	// semantics bit-for-bit. The parallel build path uses InsertBuild instead
-	// and batches the reciprocity apply at the end.
+	// (per-call), runs the insert with the core's own tls_, and
+	// synchronously applies reciprocals via the per-node-locked
+	// ConnectAndPrune — preserving the old immediate-back-edge semantics.
 	const uint32_t internal_id = store_.AllocGraphNode();
-	vector<DeferredReciprocal> local_deferred;
+	// Live-insert path: lazily grow node_locks_ past the build-time size.
+	// Safe — Insert runs serially (caller holds the rwlock via Construct).
+	ResizeNodeLocks(idx_t(internal_id) + 1);
 	const uint32_t prev_size = size_;
-	InsertBuild(internal_id, row_id, vec, label, tls_, local_deferred, internal_id_to_label_, label_to_internal_ids_);
+	InsertBuild(internal_id, row_id, vec, label, tls_, internal_id_to_label_, label_to_internal_ids_);
 	// InsertBuild's first-call branch (size_==0) sets size_=1 itself; for
 	// every subsequent call it leaves size_ untouched (parallel path owns
 	// the final SetSize). Bump here for non-first serial inserts.
 	if (prev_size > 0) {
 		size_++;
 	}
-	ApplyDeferredReciprocals(local_deferred);
 	return internal_id;
 }
 
 uint32_t AiSaqCore::InsertBuild(uint32_t internal_id, int64_t row_id, const float *vec, int64_t label,
-                                vamana::VamanaTLS &tls, vector<DeferredReciprocal> &deferred,
-                                unordered_map<uint32_t, int64_t> &local_id2label,
+                                vamana::VamanaTLS &tls, unordered_map<uint32_t, int64_t> &local_id2label,
                                 unordered_map<int64_t, vector<uint32_t>> &local_label2ids) {
 	{
 		auto nref = PinNode(internal_id);
@@ -535,7 +570,7 @@ uint32_t AiSaqCore::InsertBuild(uint32_t internal_id, int64_t row_id, const floa
 	const idx_t L_build = params_.L_build > 0 ? params_.L_build : params_.R;
 	auto cands = BeamSearch(lut.data(), L_build, 0, tls);
 	auto selected = RobustPrune(lut.data(), std::move(cands), params_.R, params_.alpha, tls);
-	ConnectAndPrune(internal_id, lut.data(), selected, tls, deferred);
+	ConnectAndPrune(internal_id, lut.data(), selected, tls);
 
 	return internal_id;
 }

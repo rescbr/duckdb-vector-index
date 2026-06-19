@@ -140,9 +140,9 @@ SinkCombineResultType PhysicalCreateAiSaqIndex::Combine(ExecutionContext &contex
 // Finalize — two-pass build
 //-------------------------------------------------------------
 
-// Parallel Vamana construct task (Phase 9 Task 5). Each task:
+// Parallel Vamana construct task (Phase 9 Task 5.5). Each task:
 //   - Owns a disjoint row range [row_start, row_end).
-//   - Owns its VamanaTLS (per-thread scratch) + deferred vector + local maps.
+//   - Owns its VamanaTLS (per-thread scratch) + local maps.
 //   - Scans its row range via a private ColumnDataScanState (NOT the shared
 //     parallel scan state — that interleaves chunks and would break the
 //     internal_id <-> PQ-slot mapping).
@@ -152,9 +152,11 @@ SinkCombineResultType PhysicalCreateAiSaqIndex::Combine(ExecutionContext &contex
 // On completion, hands its local maps to AiSaqIndex's parallel_slots_ via
 // PushParallelConstructResults. FinishEvent merges them serially.
 //
-// No rwlock is held during ExecuteTask: per-task state + deferred reciprocity
-// handles graph-state safety. The serial ApplyDeferredReciprocals step in
-// FinishEvent re-acquires the rwlock.
+// No rwlock is held during ExecuteTask. Graph-state safety is handled by
+// per-node spinlocks inside AiSaqCore::ConnectAndPrune — back-edge writes
+// take only the target node's lock (sub-µs critical section). Forward edges
+// are written to task-exclusive new internal_ids with no lock. No per-task
+// deferred accumulator, no periodic-apply lock acquisition.
 class AiSaqIndexConstructTask final : public ExecutorTask {
   public:
 	AiSaqIndexConstructTask(shared_ptr<Event> event_p, ClientContext &context, CreateAiSaqIndexGlobalState &gstate_p,
@@ -173,23 +175,9 @@ class AiSaqIndexConstructTask final : public ExecutorTask {
 		const LogLevel log_level = global_index->GetBuildLogLevel();
 		auto last_log = std::chrono::steady_clock::now();
 
-		// Periodic-reciprocity cadence: each task acquires the rwlock and
-		// drains its accumulated deferred every `periodic_apply_k` inserts.
-		// A fixed small K (~16) keeps the build-time graph dense enough that
-		// later inserts' BeamSearch finds cross-task neighbors, preserving
-		// serial-equivalent recall. A larger K (e.g. my_range/8) speed up the
-		// parallel phase but degrades recall — at K=125 on siftsmall the
-		// recall dropped from 0.999 to 0.94-0.96 due to the deferred-at-end
-		// alpha-prune collapsing the entry node's neighbor list.
-		//
-		// K=16 is a sweet spot: 16 inserts between lock acquires gives enough
-		// parallel headway to engage all cores while keeping the graph dense.
-		// See the Task 5 report for the K-sweep measurements.
-		constexpr idx_t periodic_apply_k = 16;
-
-		global_index->InsertBuildRange(executor.context, *collection, row_start, row_end, skip_row, tls_, deferred_,
+		global_index->InsertBuildRange(executor.context, *collection, row_start, row_end, skip_row, tls_,
 		                               local_row_to_internal_, local_id2label_, local_label2ids_, gstate.built_count,
-		                               thread_id, periodic_apply_k);
+		                               thread_id);
 
 		// Log throttled progress (built_count is shared across tasks).
 		if (LogInfo(log_level)) {
@@ -203,7 +191,7 @@ class AiSaqIndexConstructTask final : public ExecutorTask {
 		}
 
 		// Hand off local state to the event's collector.
-		global_index->PushParallelConstructResults(thread_id, std::move(deferred_), std::move(local_row_to_internal_),
+		global_index->PushParallelConstructResults(thread_id, std::move(local_row_to_internal_),
 		                                           std::move(local_id2label_), std::move(local_label2ids_));
 
 		event->FinishTask();
@@ -217,7 +205,6 @@ class AiSaqIndexConstructTask final : public ExecutorTask {
 	idx_t row_end;
 	idx_t skip_row;
 	vamana::VamanaTLS tls_;
-	vector<DeferredReciprocal> deferred_;
 	unordered_map<row_t, uint32_t> local_row_to_internal_;
 	unordered_map<uint32_t, int64_t> local_id2label_;
 	unordered_map<int64_t, vector<uint32_t>> local_label2ids_;
@@ -256,6 +243,12 @@ class AiSaqIndexConstructionEvent final : public BasePipelineEvent {
 		// passes PinGraphNode's D_ASSERT, and each task can use
 		// internal_id = row_ordinal deterministically.
 		global_index->PreAllocateGraphRange(total_n);
+
+		// Phase 9 Task 5.5: pre-size the per-node spinlock array. MUST happen
+		// before any parallel InsertBuild task spawns — the array is indexed
+		// by internal_id and must not be reallocated concurrently with task
+		// references into it.
+		global_index->ResizeNodeLocks(total_n);
 
 		// Parallel-construct collector: +1 slot for the leader (slot 0).
 		auto &scheduler = TaskScheduler::GetScheduler(context);
@@ -308,12 +301,14 @@ class AiSaqIndexConstructionEvent final : public BasePipelineEvent {
 			phase_ts = now;
 		};
 
-		// (1) Merge per-task maps, sort + apply deferred reciprocity, set size.
-		// This is the serial tail of parallel Pass 2 — runs under rwlock.
+		// (1) Merge per-task maps, set final size. This is the serial tail of
+		// parallel Pass 2 — runs under rwlock. (Task 5.5: no reciprocity apply
+		// here — ConnectAndPrune applied every back-edge inline during the
+		// parallel phase via per-node spinlocks.)
 		if (total_n > 0) {
 			global_index->FinalizeParallelConstruct(total_n);
 		}
-		mark("apply_deferred_reciprocals");
+		mark("merge_parallel_construct");
 
 		if (timing) {
 			fprintf(stderr, "[vindex] finalizing inline codes...\n");

@@ -797,7 +797,7 @@ void AiSaqIndex::Construct(DataChunk &input, Vector &row_ids, idx_t /*thread_idx
 }
 
 // ---------------------------------------------------------------------------
-// Phase 9 Task 5: parallel Pass 2 (Construct) coordination.
+// Phase 9 Task 5.5: parallel Pass 2 (Construct) coordination.
 //
 // The single-task path (above) takes the rwlock per-chunk and serializes every
 // insert. The parallel path replaces it with:
@@ -806,15 +806,16 @@ void AiSaqIndex::Construct(DataChunk &input, Vector &row_ids, idx_t /*thread_idx
 //      (or first non-NULL) as the entry point.
 //   2. N parallel InsertBuildRange tasks (in ExecuteTask): each task scans a
 //      disjoint row range, calls AiSaqCore::InsertBuild with its own VamanaTLS,
-//      accumulates per-task deferred reciprocals + local maps.
+//      accumulates per-task local label maps.
 //   3. PushParallelConstructResults: each task moves its local maps into its
 //      slot in parallel_slots_.
 //   4. FinalizeParallelConstruct (serial, in FinishEvent, under rwlock):
-//      merge maps, sort + apply deferred, set final size.
+//      merge maps, set final size.
 //
-// No rwlock is held during the parallel insert phase. The deferred-reciprocity
-// strategy ensures graph-state safety: forward edges are written to
-// task-exclusive internal_ids; back-edges are queued and applied serially.
+// No rwlock is held during the parallel insert phase. Graph-state safety is
+// handled by per-node spinlocks inside AiSaqCore::ConnectAndPrune — each
+// back-edge write takes only the target node's lock (sub-µs critical section).
+// Forward edges are written to task-exclusive new internal_ids with no lock.
 // ---------------------------------------------------------------------------
 
 void AiSaqIndex::InitParallelConstructCollector(idx_t num_slots) {
@@ -839,7 +840,6 @@ idx_t AiSaqIndex::LeaderInsertEntry(ClientContext & /*context*/, ColumnDataColle
 	const bool has_labels = !label_column_.empty();
 
 	vamana::VamanaTLS leader_tls(params_.seed);
-	vector<DeferredReciprocal> leader_deferred;
 	unordered_map<row_t, uint32_t> leader_row_to_internal;
 	unordered_map<uint32_t, int64_t> leader_id2label;
 	unordered_map<int64_t, vector<uint32_t>> leader_label2ids;
@@ -868,8 +868,12 @@ idx_t AiSaqIndex::LeaderInsertEntry(ClientContext & /*context*/, ColumnDataColle
 			    (label_data && !FlatVector::IsNull(scan_chunk.data[1], i)) ? label_data[i] : INT64_MIN;
 
 			// InsertBuild hits the "size_ == 0" branch and sets entry_internal_.
+			// (ConnectAndPrune is never reached for the leader insert — the
+			// first-call branch returns early — so no per-node locks are
+			// taken here. node_locks_ is already sized by ResizeNodeLocks in
+			// Schedule() before this call.)
 			core_->InsertBuild(static_cast<uint32_t>(row_ordinal), int64_t(rowid), vec_child_data + i * array_size,
-			                   label, leader_tls, leader_deferred, leader_id2label, leader_label2ids);
+			                   label, leader_tls, leader_id2label, leader_label2ids);
 			leader_row_to_internal[rowid] = static_cast<uint32_t>(row_ordinal);
 			entry_row = row_ordinal;
 			break;
@@ -881,7 +885,6 @@ idx_t AiSaqIndex::LeaderInsertEntry(ClientContext & /*context*/, ColumnDataColle
 
 	// Stash leader outputs into slot 0 (caller will merge them in Finalize).
 	if (entry_row != DConstants::INVALID_INDEX && !parallel_slots_.empty()) {
-		parallel_slots_[0].deferred = std::move(leader_deferred);
 		parallel_slots_[0].row_to_internal = std::move(leader_row_to_internal);
 		parallel_slots_[0].id2label = std::move(leader_id2label);
 		parallel_slots_[0].label2ids = std::move(leader_label2ids);
@@ -891,11 +894,10 @@ idx_t AiSaqIndex::LeaderInsertEntry(ClientContext & /*context*/, ColumnDataColle
 
 void AiSaqIndex::InsertBuildRange(ClientContext & /*context*/, ColumnDataCollection &collection, idx_t row_start,
                                   idx_t row_end, idx_t skip_row, vamana::VamanaTLS &tls,
-                                  vector<DeferredReciprocal> &deferred,
                                   unordered_map<row_t, uint32_t> &local_row_to_internal,
                                   unordered_map<uint32_t, int64_t> &local_id2label,
                                   unordered_map<int64_t, vector<uint32_t>> &local_label2ids, atomic<idx_t> &built_count,
-                                  size_t /*thread_id*/, idx_t periodic_apply_k) {
+                                  size_t /*thread_id*/) {
 	if (row_start >= row_end) {
 		return;
 	}
@@ -907,14 +909,6 @@ void AiSaqIndex::InsertBuildRange(ClientContext & /*context*/, ColumnDataCollect
 	collection.InitializeScan(scan_state, ColumnDataScanProperties::ALLOW_ZERO_COPY);
 	DataChunk scan_chunk;
 	collection.InitializeScanChunk(scan_chunk);
-
-	idx_t inserts_since_apply = 0;
-	auto maybe_apply = [&]() {
-		if (periodic_apply_k > 0 && inserts_since_apply >= periodic_apply_k) {
-			ApplyPeriodicReciprocals(deferred);
-			inserts_since_apply = 0;
-		}
-	};
 
 	auto process_chunk = [&](DataChunk &chunk, idx_t chunk_base) {
 		const auto chunk_size = chunk.size();
@@ -947,12 +941,13 @@ void AiSaqIndex::InsertBuildRange(ClientContext & /*context*/, ColumnDataCollect
 			const auto rowid = rowid_data[i];
 			const int64_t label = (label_data && !FlatVector::IsNull(chunk.data[1], i)) ? label_data[i] : INT64_MIN;
 
+			// InsertBuild's ConnectAndPrune acquires per-node spinlocks
+			// inline for back-edge writes; no global lock, no per-task
+			// deferred accumulator (Task 5.5).
 			core_->InsertBuild(static_cast<uint32_t>(row_ordinal), int64_t(rowid), vec_child_data + i * array_size,
-			                   label, tls, deferred, local_id2label, local_label2ids);
+			                   label, tls, local_id2label, local_label2ids);
 			local_row_to_internal[rowid] = static_cast<uint32_t>(row_ordinal);
 			built_count.fetch_add(1, std::memory_order_relaxed);
-			inserts_since_apply++;
-			maybe_apply();
 		}
 	};
 
@@ -972,18 +967,13 @@ void AiSaqIndex::InsertBuildRange(ClientContext & /*context*/, ColumnDataCollect
 		}
 		process_chunk(scan_chunk, scan_state.current_row_index);
 	}
-
-	// No final apply here — the task's residual deferred is handed off to
-	// AiSaqIndex::parallel_slots_ and merged in FinalizeParallelConstruct.
 }
 
-void AiSaqIndex::PushParallelConstructResults(idx_t thread_id, vector<DeferredReciprocal> &&deferred,
-                                              unordered_map<row_t, uint32_t> &&local_row_to_internal,
+void AiSaqIndex::PushParallelConstructResults(idx_t thread_id, unordered_map<row_t, uint32_t> &&local_row_to_internal,
                                               unordered_map<uint32_t, int64_t> &&local_id2label,
                                               unordered_map<int64_t, vector<uint32_t>> &&local_label2ids) {
 	D_ASSERT(idx_t(thread_id) < parallel_slots_.size());
 	auto &slot = parallel_slots_[thread_id];
-	slot.deferred = std::move(deferred);
 	slot.row_to_internal = std::move(local_row_to_internal);
 	slot.id2label = std::move(local_id2label);
 	slot.label2ids = std::move(local_label2ids);
@@ -1004,29 +994,10 @@ void AiSaqIndex::FinalizeParallelConstruct(idx_t total_n) {
 		}
 	}
 
-	// (3) Concatenate per-task deferred lists, then sort by new_internal_id
-	// for deterministic output regardless of thread scheduling.
-	vector<DeferredReciprocal> all_deferred;
-	idx_t total_deferred = 0;
-	for (const auto &slot : parallel_slots_) {
-		total_deferred += slot.deferred.size();
-	}
-	all_deferred.reserve(total_deferred);
-	for (const auto &slot : parallel_slots_) {
-		all_deferred.insert(all_deferred.end(), slot.deferred.begin(), slot.deferred.end());
-	}
-	std::sort(all_deferred.begin(), all_deferred.end(), [](const DeferredReciprocal &a, const DeferredReciprocal &b) {
-		return a.new_internal_id < b.new_internal_id;
-	});
-
-	// (4) Apply deferred reciprocity (serial). core_->ApplyDeferredReciprocals
-	// uses tls_ for any overflow re-prune work.
-	if (!all_deferred.empty()) {
-		core_->ApplyDeferredReciprocals(all_deferred);
-	}
-
-	// (5) Set the final node count. Tasks didn't bump size_ during InsertBuild
-	// (that would race); set it once here.
+	// (3) Set the final node count. Tasks didn't bump size_ during InsertBuild
+	// (that would race); set it once here. Per-node spinlocks in
+	// ConnectAndPrune applied every back-edge inline during the parallel
+	// phase — no serial reciprocity apply is needed (Task 5.5).
 	core_->SetSize(static_cast<uint32_t>(total_n));
 	index_size = core_->Size();
 

@@ -8,9 +8,12 @@
 #define SIMSIMD_NATIVE_BF16 0
 #include "simsimd/simsimd.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <thread>
+#include <vector>
 
 namespace duckdb {
 namespace vindex {
@@ -105,21 +108,48 @@ void PqQuantizer::Train(const float *samples, idx_t n, idx_t dim) {
 	const idx_t k = CentroidsPerSlot();
 	codebook_.assign(idx_t(m_) * k * sub_dim, 0.0f);
 
-	// Per-slot training: extract column-block of size (n × sub_dim) and run
-	// k-means++. For n < k (rare — tests only), KMeansPlusPlus pads with
-	// sample repeats; we still get a usable codebook.
-	vector<float> sub_buffer(n * sub_dim);
-	for (idx_t s = 0; s < idx_t(m_); s++) {
+	// Each slot's k-means++ is fully independent (disjoint codebook region,
+	// disjoint sub_buffer). Parallelize across slots when train_threads_ > 1.
+	// The sub_buffer extraction (strided memcpy from samples) is cheap
+	// relative to k-means++ itself, so we do it per-slot inside each task.
+	const uint32_t num_slots = uint32_t(m_);
+	const uint32_t num_threads = std::min<uint32_t>(train_threads_, num_slots);
+
+	auto train_slot = [&](uint32_t s) {
+		vector<float> sub_buffer(n * sub_dim);
 		for (idx_t i = 0; i < n; i++) {
-			std::memcpy(sub_buffer.data() + i * sub_dim, samples + i * dim + s * sub_dim,
-			            sub_dim * sizeof(float));
+			std::memcpy(sub_buffer.data() + i * sub_dim, samples + i * dim + s * sub_dim, sub_dim * sizeof(float));
 		}
-		// Distinct seed per slot — otherwise every slot's k-means picks the
-		// same initial seeds (identical RNG stream).
-		const uint64_t slot_seed = seed_ ^ (0x9E3779B97F4A7C15ULL * (s + 1));
+		const uint64_t slot_seed = seed_ ^ (0x9E3779B97F4A7C15ULL * (uint64_t(s) + 1));
 		ivf::KMeansPlusPlus(sub_buffer.data(), n, sub_dim, k, slot_seed, /*max_iters=*/25,
-		                    codebook_.data() + s * k * sub_dim);
+		                    codebook_.data() + idx_t(s) * k * sub_dim);
+	};
+
+	if (num_threads <= 1) {
+		for (uint32_t s = 0; s < num_slots; s++) {
+			train_slot(s);
+		}
+	} else {
+		vector<std::thread> workers;
+		std::atomic<uint32_t> next_slot{0};
+		const uint32_t hw_threads = std::max<uint32_t>(1, std::thread::hardware_concurrency());
+		const uint32_t spawn_count = std::min(num_threads, hw_threads);
+		for (uint32_t t = 0; t < spawn_count; t++) {
+			workers.emplace_back([&]() {
+				while (true) {
+					const uint32_t s = next_slot.fetch_add(1, std::memory_order_relaxed);
+					if (s >= num_slots) {
+						break;
+					}
+					train_slot(s);
+				}
+			});
+		}
+		for (auto &w : workers) {
+			w.join();
+		}
 	}
+
 	trained_ = true;
 
 	// Phase 9.5 iter 1: precompute centroid-pair distances so CodeDistance

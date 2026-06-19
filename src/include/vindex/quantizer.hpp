@@ -38,6 +38,14 @@ class Quantizer {
 public:
 	virtual ~Quantizer() = default;
 
+	// Hint: how many threads Train() may use for parallelizable work.
+	// Default 1 = serial. Index layer sets this from TaskScheduler before
+	// calling Train so multi-slot quantizers (PQ, ScaNN) can parallelize
+	// across sub-vector slots.
+	void SetTrainThreads(uint32_t n) {
+		train_threads_ = n > 0 ? n : 1;
+	}
+
 	// One-shot training on a sample of vectors. Expected to be called once at
 	// CREATE INDEX time, before any Encode(). Implementations that don't need
 	// training (Flat) return immediately.
@@ -104,6 +112,9 @@ public:
 	// as part of SerializeToDisk/SerializeToWAL.
 	virtual void Serialize(vector<data_t> &out) const = 0;
 	virtual void Deserialize(const_data_ptr_t in, idx_t size) = 0;
+
+protected:
+	uint32_t train_threads_ = 1;
 };
 
 // Factory. Parses `WITH (quantizer = '...', bits = N, ...)` options.

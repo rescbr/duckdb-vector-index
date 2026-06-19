@@ -560,6 +560,12 @@ void AiSaqIndex::TrainQuantizer(ColumnDataCollection &collection, idx_t sample_c
 	auto lock = rwlock.GetExclusiveLock();
 	vector<float> buf;
 	const idx_t n = SampleFloats(collection, dim_, sample_cap, buf);
+	// Phase 9.5 iter 2a: parallelize per-slot k-means++ across cores.
+	// PqQuantizer::Train uses the thread hint to spawn workers; each slot's
+	// k-means is fully independent (disjoint codebook region, private
+	// sub_buffer).
+	auto &scheduler = TaskScheduler::GetScheduler(db.GetDatabase());
+	quantizer_->SetTrainThreads(uint32_t(scheduler.NumberOfThreads()));
 	quantizer_->Train(buf.data(), n, dim_);
 }
 

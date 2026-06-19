@@ -314,6 +314,136 @@ spinlock strategy produces graph topology equivalent to serial insertion
 (recall within 0.001 on all bench configurations). Enable
 `SET vindex_log_level = 'info'` to see per-phase wall-clock timing.
 
+### Scaling guide
+
+AiSAQ's footprint has two dimensions: **storage** (on disk, always
+proportional to N) and **build-time RAM** (in memory, depends on the
+build strategy). Understanding both is essential for datasets above a
+few million vectors.
+
+#### Storage vs RAM
+
+| What | Where | Size | Evictable? |
+|---|---|---|---|
+| PQ code pages | DuckDB blocks (disk) | `N × code_size` | Yes (BufferPool paged on demand) |
+| Graph node blocks | DuckDB blocks (disk) | `N × (16 + R×4)` | Yes (BufferPool paged on demand) |
+| Original `FLOAT[d]` column | DuckDB table (disk) | `N × dim × 4` | Yes (column store) |
+| Build-time flat buffers (`pq_buffer`) | RAM only | `N × (code_size + node_size)` | No — freed after build |
+| Cross-distance table | RAM only | `m × K² × 4` (4 MB for SIFT) | No — lives on the quantizer |
+| Search-time working set | RAM only | Bounded by `memory_limit` | Yes (BufferPool evicts cold pages) |
+
+The index's persistent footprint on disk is `N × (code_size + node_size)`
+— roughly **288 bytes per vector** for SIFT (128-d, m=16, bits=8, R=64).
+For 768-d OpenAI-style embeddings (m=192): **464 bytes per vector**.
+
+During search, only the hot pages (graph blocks + PQ code pages near the
+query's graph neighborhood) are in RAM. Cold pages evict via the
+BufferPool under `memory_limit` pressure. This is what lets AiSAQ scale
+past RAM — the **index on disk** can be much larger than the **working
+set in RAM**.
+
+During build with `pq_buffer` strategy, ALL codes and nodes are loaded
+into flat RAM buffers for zero-I/O construction. The build-time RAM
+equals the persistent footprint. With `paged` strategy, codes are read
+on demand from the BufferPool — build RAM is small, but construction is
+slower (~7× per the benchmarks above).
+
+#### Per-vector footprint formula
+
+```
+code_size = m × ceil(bits / 8)           bytes
+node_size = (16 + R × 4), padded to 8    bytes   (graph header + R neighbor IDs)
+total_per_vector = code_size + node_size  bytes
+```
+
+Common configurations (128-d SIFT and 768-d embeddings):
+
+| Config | `m` | `bits` | `code_size` | `R` | `node_size` | **Per vector** |
+|---|---|---|---|---|---|---|
+| SIFT 128-d, PQ-8 | 16 | 8 | 16 B | 64 | 272 B | **288 B** |
+| SIFT 128-d, PQ-8, R=32 | 16 | 8 | 16 B | 32 | 144 B | **160 B** |
+| Embeddings 768-d, PQ-8 | 192 | 8 | 192 B | 64 | 272 B | **464 B** |
+| Embeddings 768-d, PQ-4 | 192 | 4 | 96 B | 64 | 272 B | **368 B** |
+
+#### Scaling reference
+
+| Dataset | Per vector | Index on disk | `pq_buffer` build RAM | Default strategy (32 GB machine) | Build time (10 cores) |
+|---|---|---|---|---|---|
+| 1M × 128-d | 288 B | 288 MB | 290 MB | `pq_buffer` (fits) | **~22 s** *(measured)* |
+| 10M × 128-d | 288 B | 2.9 GB | 2.9 GB | `pq_buffer` (fits in 25% budget) | Scales roughly linearly with N |
+| 100M × 128-d | 288 B | 29 GB | 29 GB | `paged` (exceeds 25% budget) | Scales roughly linearly with N |
+| 1M × 768-d | 464 B | 464 MB | 470 MB | `pq_buffer` (fits) | Scales with `m` (more k-means++ slots) |
+| 10M × 768-d | 464 B | 4.6 GB | 4.7 GB | `pq_buffer` (fits in 25% budget) | Scales with N × m |
+
+Build times above 1M are extrapolations — the Vamana graph gets denser as
+N grows, so scaling may be slightly superlinear. Benchmark on your
+hardware for accurate planning.
+
+#### Recommended configurations by scale
+
+**1M vectors — defaults work as-is:**
+
+```sql
+-- pq_buffer strategy selected automatically; ~290 MB RAM, ~22 s on 10 cores.
+CREATE INDEX idx ON t USING AISAQ(vec)
+    WITH (quantizer='pq', m=16, bits=8, aisaq_r=64, aisaq_l=100);
+```
+
+**10M vectors — explicit RAM budget to reserve build buffers:**
+
+```sql
+-- Ensure DuckDB has enough headroom for the flat build buffers.
+-- 10M × 288 B ≈ 2.9 GB; reserve 4 GB to be safe.
+SET memory_limit = '16GB';
+CREATE INDEX idx ON t USING AISAQ(vec)
+    WITH (quantizer='pq', m=16, bits=8, aisaq_r=64, aisaq_l=100,
+          ram_budget_mb=4096);
+```
+
+**100M vectors — paged strategy, tune R to fit your machine:**
+
+```sql
+-- At 100M, pq_buffer needs ~29 GB — exceeds the default 25% budget on
+-- most machines. Two options:
+--   1) If you have 64+ GB RAM, force pq_buffer with ram_budget_mb:
+SET memory_limit = '64GB';
+CREATE INDEX idx ON t USING AISAQ(vec)
+    WITH (quantizer='pq', m=16, bits=8, aisaq_r=64, aisaq_l=100,
+          ram_budget_mb=30720);
+
+--   2) Otherwise use paged (slower build, but works at any scale).
+--      Consider lowering aisaq_r to 32 to reduce per-node memory:
+CREATE INDEX idx ON t USING AISAQ(vec)
+    WITH (quantizer='pq', m=16, bits=8, aisaq_r=32, aisaq_l=100,
+          build_strategy='paged');
+```
+
+> **When to lower `aisaq_r`**: keep R=64 if your RAM allows it — higher
+> connectivity improves recall. Reduce to 32 only when `pq_buffer` doesn't
+> fit and you want to minimize per-node memory in the BufferPool. The
+> recall impact at 100M scale is untested; benchmark with your data.
+
+#### Strategy selection
+
+The `auto` strategy (default) picks `pq_buffer` when
+`N × (code_size + node_size)` fits in 25 % of `memory_limit` (the
+`ram_budget_mb=0` default). Otherwise it falls back to `paged`.
+
+Check which strategy was selected:
+
+```sql
+SET vindex_log_level = 'info';
+CREATE INDEX idx ON t USING AISAQ(vec) WITH (...);
+-- Look for: [vindex] AiSAQ build: strategy=pq_buffer, N=...
+```
+
+`pq_buffer` is ~7× faster than `paged` (zero BufferPool calls during
+construction vs per-prune page pins). Always prefer `pq_buffer` when RAM
+allows. The `exact_prune` strategy adds full-precision vectors for prune
+distances — ~8× slower than `pq_buffer` but produces the best graph
+topology (marginally higher recall). Use it only when recall is critical
+and build time is secondary.
+
 ### Build acceleration
 
 AiSAQ supports a three-tier build acceleration system controlled by

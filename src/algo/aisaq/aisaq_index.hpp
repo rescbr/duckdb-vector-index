@@ -59,8 +59,13 @@ class AiSaqIndex : public VectorIndex {
 
 	void TrainQuantizer(ColumnDataCollection &collection, idx_t sample_cap = 65536);
 	// Pass 1 of the two-pass build: encode every vector to a PQ code and write
-	// directly to the block store's PQ pages.
+	// directly to the block store's PQ pages. Spawns NumberOfThreads() tasks,
+	// each owning a disjoint page-aligned row range. Output is bit-identical to
+	// the single-threaded version.
 	void EncodePqCodes(ColumnDataCollection &collection);
+	// Per-task PQ encode worker. Public so the AiSaqPqEncodeTask defined in the
+	// .cpp can call it without friend declarations.
+	void EncodePqRange(ColumnDataCollection &collection, idx_t row_start, idx_t row_end);
 	// Build-finalize hooks forwarded to the core.
 	void FinalizeInlineCodes() {
 		if (core_) {

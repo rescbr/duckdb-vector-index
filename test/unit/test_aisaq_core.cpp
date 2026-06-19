@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstring>
 #include <random>
+#include <thread>
 #include <unordered_set>
 
 using duckdb::BlockManager;
@@ -642,4 +643,92 @@ TEST_CASE("AiSaqCore multiple entry points improve recall on clustered data", "[
 	INFO("Recall with 8 entry points = " << recall_8ep);
 	// More entry points should help (or at least not hurt) on clustered data.
 	REQUIRE(recall_8ep >= recall_1ep - 0.05f);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9 Task 2: parallel EncodePqCodes byte-identity test.
+//
+// Mirrors the partitioning scheme in AiSaqIndex::EncodePqRange: split
+// [0, total_pages) into T disjoint page ranges, encode each row directly into
+// its assigned page slot, and verify the resulting block-store pages are
+// byte-identical to the serial WriteAllPqCodes path. This is the cleanest way
+// to exercise the per-task partitioning logic without standing up a full
+// AiSaqIndex (which needs TableIOManager + AttachedDatabase).
+// ---------------------------------------------------------------------------
+TEST_CASE("Parallel PQ encoding produces byte-identical pages to serial", "[aisaq_pq_parallel][unit]") {
+	MemoryDB mem;
+
+	constexpr idx_t N = 100000; // span multiple pages (codes_per_page ~ 32k for code_size=8)
+	constexpr idx_t D = 32;
+	constexpr uint8_t M = 8;
+	constexpr uint8_t BITS = 8;
+	constexpr idx_t NUM_THREADS = 4;
+
+	auto data = RandomGaussian(N, D, 0xAA11u);
+	PqQuantizer quant(MetricKind::L2SQ, D, M, BITS, 99);
+	quant.Train(data.data(), N, D);
+
+	// --- Serial baseline ---
+	AiSaqBlockStore serial_store(*mem.bm, *mem.bufmgr);
+	serial_store.RegisterPqLayout(quant.CodeSize());
+	WriteAllPqCodes(serial_store, quant, data.data(), N, D);
+
+	// --- Parallel via simulated per-task partitioning ---
+	AiSaqBlockStore parallel_store(*mem.bm, *mem.bufmgr);
+	parallel_store.RegisterPqLayout(quant.CodeSize());
+
+	const idx_t code_size = quant.CodeSize();
+	const idx_t codes_per_page = parallel_store.CodesPerPage();
+	const idx_t total_pages = (N + codes_per_page - 1) / codes_per_page;
+	REQUIRE(total_pages > 1); // sanity: actually exercise page boundaries
+
+	// Pre-allocate all pages once (mirrors EncodePqCodes).
+	if (total_pages > 0) {
+		parallel_store.EnsurePqCapacity(static_cast<uint32_t>(total_pages - 1));
+	}
+
+	// Each "task" runs the same body as AiSaqIndex::EncodePqRange.
+	auto run_task = [&](idx_t t) {
+		const uint32_t p_start = static_cast<uint32_t>(t * total_pages / NUM_THREADS);
+		const uint32_t p_end = static_cast<uint32_t>((t + 1) * total_pages / NUM_THREADS);
+		if (p_start >= p_end) {
+			return;
+		}
+		const idx_t row_start = idx_t(p_start) * codes_per_page;
+		const idx_t row_end = std::min<idx_t>(idx_t(p_end) * codes_per_page, N);
+
+		std::vector<duckdb::data_t> page(codes_per_page * code_size, 0);
+		uint32_t current_page_idx = static_cast<uint32_t>(row_start / codes_per_page);
+		idx_t slot_in_page = 0;
+
+		for (idx_t i = row_start; i < row_end; i++) {
+			quant.Encode(data.data() + i * D, page.data() + slot_in_page * code_size);
+			slot_in_page++;
+			if (slot_in_page >= codes_per_page) {
+				parallel_store.WritePqPage(current_page_idx, page.data());
+				current_page_idx++;
+				slot_in_page = 0;
+				std::memset(page.data(), 0, page.size());
+			}
+		}
+		if (slot_in_page > 0) {
+			parallel_store.WritePqPage(current_page_idx, page.data());
+		}
+	};
+
+	std::vector<std::thread> workers;
+	for (idx_t t = 0; t < NUM_THREADS; t++) {
+		workers.emplace_back(run_task, t);
+	}
+	for (auto &w : workers) {
+		w.join();
+	}
+
+	// --- Byte-identity check ---
+	REQUIRE(parallel_store.PqPageCount() == serial_store.PqPageCount());
+	for (uint32_t p = 0; p < serial_store.PqPageCount(); p++) {
+		auto serial_handle = serial_store.PinPqPage(p);
+		auto parallel_handle = parallel_store.PinPqPage(p);
+		REQUIRE(std::memcmp(serial_handle.Ptr(), parallel_handle.Ptr(), codes_per_page * code_size) == 0);
+	}
 }

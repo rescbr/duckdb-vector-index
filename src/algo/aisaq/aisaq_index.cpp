@@ -13,9 +13,12 @@
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/vector_size.hpp"
 #include "duckdb/execution/index/index_type.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/parallel/task_executor.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/storage_info.hpp"
 #include "duckdb/storage/partial_block_manager.hpp"
@@ -552,8 +555,37 @@ void AiSaqIndex::TrainQuantizer(ColumnDataCollection &collection, idx_t sample_c
 	quantizer_->Train(buf.data(), n, dim_);
 }
 
+// Per-task PQ encoder. Each task processes rows [row_start, row_end) of the
+// collection — a page-aligned, disjoint range — and writes the corresponding
+// PQ pages + flat-buffer slots. See AiSaqIndex::EncodePqCodes for the
+// partitioning rationale.
+class AiSaqPqEncodeTask final : public BaseExecutorTask {
+  public:
+	AiSaqPqEncodeTask(TaskExecutor &executor, AiSaqIndex &index, ColumnDataCollection &collection, idx_t row_start,
+	                  idx_t row_end)
+	    : BaseExecutorTask(executor), index_(index), collection_(collection), row_start_(row_start), row_end_(row_end) {
+	}
+
+	void ExecuteTask() override {
+		index_.EncodePqRange(collection_, row_start_, row_end_);
+	}
+
+	string TaskType() const override {
+		return "AiSaqPqEncodeTask";
+	}
+
+  private:
+	AiSaqIndex &index_;
+	ColumnDataCollection &collection_;
+	idx_t row_start_;
+	idx_t row_end_;
+};
+
 void AiSaqIndex::EncodePqCodes(ColumnDataCollection &collection) {
-	auto lock = rwlock.GetExclusiveLock();
+	// Pass 1 does not touch graph state — no rwlock needed. Each task owns a
+	// disjoint page range; the only shared mutable state is the atomic
+	// pq_encode_progress_ counter and the pre-allocated flat build buffers
+	// (whose slot ranges are also disjoint across tasks).
 	const idx_t code_size = quantizer_->CodeSize();
 	const idx_t codes_per_page = block_store_->CodesPerPage();
 	const idx_t N = collection.Count();
@@ -570,14 +602,12 @@ void AiSaqIndex::EncodePqCodes(ColumnDataCollection &collection) {
 
 	if (LogInfo(build_log_level_)) {
 		const char *strat_name = build_strategy_ == BuildStrategy::EXACT_PRUNE ? "exact_prune"
-		                    : build_strategy_ == BuildStrategy::PQ_BUFFER     ? "pq_buffer"
-		                    : "paged";
-		fprintf(stderr, "[vindex] AiSAQ build: strategy=%s, N=%llu, pq_buffer=%lluMB",
-		        strat_name, (unsigned long long)N,
-		        (unsigned long long)(N * code_size / (1024 * 1024)));
+		                         : build_strategy_ == BuildStrategy::PQ_BUFFER ? "pq_buffer"
+		                                                                     : "paged";
+		fprintf(stderr, "[vindex] AiSAQ build: strategy=%s, N=%llu, pq_buffer=%lluMB", strat_name,
+		        (unsigned long long)N, (unsigned long long)(N * code_size / (1024 * 1024)));
 		if (use_pq_buffer) {
-			fprintf(stderr, ", node_buffer=%lluMB",
-			        (unsigned long long)(N * core_->StaticNodeSize() / (1024 * 1024)));
+			fprintf(stderr, ", node_buffer=%lluMB", (unsigned long long)(N * core_->StaticNodeSize() / (1024 * 1024)));
 		}
 		if (use_fp_buffer) {
 			fprintf(stderr, ", fp_buffer=%lluMB", (unsigned long long)(N * dim_ * 4 / (1024 * 1024)));
@@ -586,68 +616,140 @@ void AiSaqIndex::EncodePqCodes(ColumnDataCollection &collection) {
 		fprintf(stderr, "[vindex] PQ encoding: 0/%llu\n", (unsigned long long)N);
 	}
 
-	vector<data_t> page(codes_per_page * code_size, 0);
-	uint32_t page_idx = 0;
-	idx_t slot = 0;
-	idx_t global_slot = 0;
-	auto last_log = std::chrono::steady_clock::now();
+	// Pre-allocate every PQ page once, up front. Removes the lazy-block-
+	// allocation race in WritePqPage (each call now just memcpys into an
+	// already-owned block) and guarantees disjoint page ownership across tasks.
+	const idx_t total_pages = (N + codes_per_page - 1) / codes_per_page;
+	if (total_pages > 0) {
+		block_store_->EnsurePqCapacity(static_cast<uint32_t>(total_pages - 1));
+	}
 
-	DataChunk scan_chunk;
-	collection.InitializeScanChunk(scan_chunk);
+	// Spawn N tasks partitioned by page-aligned row range. Each task owns
+	// pages [p_start, p_end) which corresponds to rows
+	// [p_start * codes_per_page, min(p_end * codes_per_page, N)). Page writes
+	// are non-overlapping by construction; flat-buffer writes are
+	// non-overlapping because slot ranges are disjoint.
+	auto &scheduler = TaskScheduler::GetScheduler(db.GetDatabase());
+	const size_t num_threads = std::max<size_t>(1, NumericCast<size_t>(scheduler.NumberOfThreads()));
+
+	const auto encode_start = std::chrono::steady_clock::now();
+	TaskExecutor executor(scheduler);
+	if (N > 0) {
+		for (size_t t = 0; t < num_threads; t++) {
+			const uint32_t p_start = static_cast<uint32_t>(t * total_pages / num_threads);
+			const uint32_t p_end = static_cast<uint32_t>((t + 1) * total_pages / num_threads);
+			if (p_start >= p_end) {
+				continue;
+			}
+			const idx_t row_start = idx_t(p_start) * codes_per_page;
+			const idx_t row_end = std::min(idx_t(p_end) * codes_per_page, N);
+			executor.ScheduleTask(make_uniq<AiSaqPqEncodeTask>(executor, *this, collection, row_start, row_end));
+		}
+		executor.WorkOnTasks();
+	}
+	if (LogInfo(build_log_level_)) {
+		const double elapsed =
+		    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - encode_start).count();
+		fprintf(stderr, "[vindex] PQ encoding complete: %llu vectors in %.0fms (%llu tasks)\n", (unsigned long long)N,
+		        elapsed, (unsigned long long)num_threads);
+	}
+
+	if (pq_encode_progress_) {
+		pq_encode_progress_->store(N);
+	}
+}
+
+void AiSaqIndex::EncodePqRange(ColumnDataCollection &collection, idx_t row_start, idx_t row_end) {
+	if (row_start >= row_end) {
+		return;
+	}
+
+	const idx_t code_size = quantizer_->CodeSize();
+	const idx_t codes_per_page = block_store_->CodesPerPage();
+	const idx_t dim = dim_;
+	const bool use_pq_buffer = (build_strategy_ != BuildStrategy::PAGED);
+	const bool use_fp_buffer = (build_strategy_ == BuildStrategy::EXACT_PRUNE);
+
+	// Per-task single-page buffer. Zero-initialised so the trailing slots of the
+	// final partial page (if this task owns it) match the serial path exactly.
+	vector<data_t> page(codes_per_page * code_size, 0);
+	uint32_t current_page_idx = static_cast<uint32_t>(row_start / codes_per_page);
+	idx_t slot_in_page = 0; // row_start is page-aligned, so always starts at 0.
+	idx_t processed = 0;
+
 	ColumnDataScanState scan_state;
 	collection.InitializeScan(scan_state, {0}, ColumnDataScanProperties::ALLOW_ZERO_COPY);
+	DataChunk scan_chunk;
+	collection.InitializeScanChunk(scan_chunk);
 
-	while (collection.Scan(scan_state, scan_chunk)) {
-		const auto chunk_size = scan_chunk.size();
+	auto process_chunk = [&](DataChunk &chunk, idx_t chunk_base) {
+		const auto chunk_size = chunk.size();
 		if (chunk_size == 0) {
-			continue;
+			return;
 		}
-		scan_chunk.Flatten();
-		auto &vec_vec = scan_chunk.data[0];
+		chunk.Flatten();
+		auto &vec_vec = chunk.data[0];
 		auto &child_vec = ArrayVector::GetEntry(vec_vec);
 		const auto array_size = ArrayType::GetSize(vec_vec.GetType());
 		auto vec_child_data = FlatVector::GetData<float>(child_vec);
 		for (idx_t i = 0; i < chunk_size; i++) {
-			if (FlatVector::IsNull(vec_vec, i)) {
-				std::memset(page.data() + slot * code_size, 0, code_size);
-			} else {
-				quantizer_->Encode(vec_child_data + i * array_size, page.data() + slot * code_size);
+			const idx_t local_slot = chunk_base + i;
+			if (local_slot < row_start) {
+				continue;
 			}
-			// Copy to flat build buffers (Tier 2/3).
+			if (local_slot >= row_end) {
+				return;
+			}
+			if (FlatVector::IsNull(vec_vec, i)) {
+				std::memset(page.data() + slot_in_page * code_size, 0, code_size);
+			} else {
+				quantizer_->Encode(vec_child_data + i * array_size, page.data() + slot_in_page * code_size);
+			}
+			// Copy to flat build buffers (Tier 2/3). Slot ranges are disjoint
+			// across tasks so no synchronisation is needed.
 			if (use_pq_buffer) {
-				std::memcpy(build_codes_buffer_.data() + global_slot * code_size,
-				            page.data() + slot * code_size, code_size);
+				std::memcpy(build_codes_buffer_.data() + local_slot * code_size, page.data() + slot_in_page * code_size,
+				            code_size);
 			}
 			if (use_fp_buffer) {
-				std::memcpy(build_vectors_buffer_.data() + global_slot * dim_,
-				            vec_child_data + i * array_size, dim_ * sizeof(float));
+				std::memcpy(build_vectors_buffer_.data() + local_slot * dim, vec_child_data + i * array_size,
+				            dim * sizeof(float));
 			}
-			slot++;
-			global_slot++;
-			if (slot >= codes_per_page) {
-				block_store_->WritePqPage(page_idx, page.data());
-				page_idx++;
-				slot = 0;
+			slot_in_page++;
+			processed++;
+			if (slot_in_page >= codes_per_page) {
+				block_store_->WritePqPage(current_page_idx, page.data());
+				current_page_idx++;
+				slot_in_page = 0;
 				std::memset(page.data(), 0, page.size());
 			}
 		}
-		if (pq_encode_progress_) {
-			pq_encode_progress_->store(global_slot);
+	};
+
+	// Position the scan at the chunk containing row_start. The chunk may begin
+	// before row_start (page boundaries aren't necessarily chunk boundaries);
+	// process_chunk discards leading rows outside [row_start, row_end).
+	if (row_start > 0) {
+		if (!collection.Seek(row_start, scan_state, scan_chunk)) {
+			return;
 		}
-		if (LogInfo(build_log_level_)) {
-			auto now = std::chrono::steady_clock::now();
-			if (now - last_log > std::chrono::seconds(2)) {
-				fprintf(stderr, "[vindex] PQ encoding: %llu/%llu (%.0f%%)\n", (unsigned long long)global_slot,
-				        (unsigned long long)N, 100.0 * double(global_slot) / double(N));
-				last_log = now;
-			}
+		process_chunk(scan_chunk, scan_state.current_row_index);
+	}
+
+	while (collection.Scan(scan_state, scan_chunk)) {
+		if (scan_state.current_row_index >= row_end) {
+			break;
 		}
+		process_chunk(scan_chunk, scan_state.current_row_index);
 	}
-	if (slot > 0) {
-		block_store_->WritePqPage(page_idx, page.data());
+
+	// Flush the final partial page (matches the serial tail-flush at line 646).
+	if (slot_in_page > 0) {
+		block_store_->WritePqPage(current_page_idx, page.data());
 	}
+
 	if (pq_encode_progress_) {
-		pq_encode_progress_->store(global_slot);
+		pq_encode_progress_->fetch_add(processed);
 	}
 }
 

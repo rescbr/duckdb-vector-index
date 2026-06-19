@@ -9,6 +9,7 @@
 #include "simsimd/simsimd.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
